@@ -14,6 +14,7 @@ enum MacTrace {
     private static var pendingPaint: [(inputId: Int, injectEndMs: Double)] = []
     private static var lastCaptureMs: Double = 0
     private static var finalizedSessions: Set<String> = []
+    private static var pingSeq = 0
     private static var finalizeWork: DispatchWorkItem?
     private static let finalizeQueue = DispatchQueue(label: "trace.finalize")
     /// Ingest + disk export — never blocks the input/video queue.
@@ -39,6 +40,7 @@ enum MacTrace {
         pendingPaint.removeAll()
         lastCaptureMs = now
         finalizedSessions.remove(sessionId)
+        pingSeq = 0
         lock.unlock()
         Log.info("[trace] Mac session started id=\(sessionId) mode=\(mode.rawValue) maxFrames=\(maxFrames) maxInputs=\(maxInputs)")
     }
@@ -147,6 +149,17 @@ enum MacTrace {
         lock.lock()
         defer { lock.unlock() }
         return lastSendDoneMs
+    }
+
+    /// Mac recv ping → send pong on :9000 (subset of RTT; see iPad `ping.rtt` for full trip).
+    static func recordPingMac(recvMs: Double, pongMs: Double) {
+        guard TraceCollector.shared.tracesInput else { return }
+        lock.lock()
+        pingSeq += 1
+        let id = pingSeq
+        lock.unlock()
+        TraceCollector.shared.span(TracePhase.pingMac, rowKind: TraceRowKind.ping,
+                                   rowId: id, startMs: recvMs, endMs: pongMs, side: .mac)
     }
 
     static func inputWire(inputId: Int, wireStartMs: Double, recvMs: Double) {

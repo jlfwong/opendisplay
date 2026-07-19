@@ -430,6 +430,7 @@ final class PhoneReceiver: ObservableObject {
                 IPadTrace.setClockOffset(best.offset)
             }
             lastRttMs = rtt
+            IPadTrace.recordPong(pingTDev: t1, pongTDev: t2, rttMs: rtt)
         case "ping":
             // The Mac piggybacks its send-side health on liveness pings.
             if let enc = obj["encDrops"] as? Int {

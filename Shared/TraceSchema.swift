@@ -12,13 +12,13 @@ enum WireTrace {
     static let traceReady = "traceReady"
 }
 
-/// One horizontal span on a single row (frame lifecycle or input event).
+/// One timed span in a capture session (frame pipeline, input event, or ping).
 struct TraceSpan: Codable, Equatable {
-    /// "frame" or "input"
+    /// "frame", "input", or "ping"
     let rowKind: String
-    /// frame sequence (Mac-assigned) or input sequence (iPad-assigned)
+    /// frame sequence (Mac-assigned), input id (iPad-assigned), or ping sample id
     let rowId: Int
-    /// Phase name — non-overlapping spans within a row share the same rowId.
+    /// Phase name — e.g. `frame.encode`, `input.wire`, `ping.rtt`
     let phase: String
     /// Unified timeline in milliseconds (Mac clock; iPad converts via offset).
     let startMs: Double
@@ -49,7 +49,7 @@ enum TraceMode: String, Codable {
 
 /// Canonical phase names — keep stable for Perfetto slice filters.
 enum TracePhase {
-    // Input row: iPad OS delivery → Mac compositor paint (one row per event)
+    // Input: iPad OS delivery → Mac compositor paint
     static let inputOs = "input.os"               // UIKit delivery → InputCapture emit
     static let inputQueue = "input.queue"         // emit → receiver queue runs
     static let inputSend = "input.send"           // queue → TCP send ack
@@ -60,7 +60,7 @@ enum TracePhase {
     // Legacy aliases (older traces)
     static let inputEmit = "input.emit"
 
-    // Frame row (Mac capture → iPad display)
+    // Frame: Mac capture → iPad display
     static let frameSck = "frame.sck"           // SCK delivered pixel buffer
     static let frameEncodeWait = "frame.enc_wait" // SCK → encode() submit
     static let frameEncode = "frame.encode"     // VTCompressionSession
@@ -70,11 +70,16 @@ enum TracePhase {
     static let frameDisplay = "frame.display"   // CMSampleBuffer → layer enqueue
     static let framePresent = "frame.present"   // Metal presented (optional)
     static let frameDropped = "frame.dropped"   // skipped before encode
+
+    // Ping/pong on control channel (:9000) — Mac-unified timeline
+    static let pingRtt = "ping.rtt"             // iPad ping sent → pong received
+    static let pingMac = "ping.mac"             // Mac recv ping → send pong
 }
 
 enum TraceRowKind {
     static let frame = "frame"
     static let input = "input"
+    static let ping = "ping"
 }
 
 // MARK: - Chrome Trace Event Format (Perfetto-compatible)
@@ -98,32 +103,30 @@ struct ChromeTraceEvent: Codable {
 
 enum TraceExporter {
 
-    /// Single process, one row per frame/input — full Mac→iPad pipeline on each row.
+    /// Single process, three fixed Perfetto tracks (Mac-unified timeline).
     private static let pipelinePid = 1
 
-    /// Input traces capture every event down→up; Perfetto export keeps the tail only.
-    static let inputExportRowLimit = 200
+    /// Fixed track ids — one lane per pipeline, not per frame/event.
+    private enum Track {
+        static let frames = 1
+        static let input = 2
+        static let ping = 3
 
-    /// Canonical phase order so merged rows read left→right as capture→glass.
-    private static let phaseOrder: [String: Int] = [
-        TracePhase.frameSck: 0,
-        TracePhase.frameEncodeWait: 10,
-        TracePhase.frameEncode: 20,
-        TracePhase.frameTcpSend: 30,
-        TracePhase.frameTcpTransit: 40,
-        TracePhase.frameRecv: 50,
-        TracePhase.frameDisplay: 60,
-        TracePhase.framePresent: 70,
-        TracePhase.frameDropped: 90,
-        TracePhase.inputOs: 0,
-        TracePhase.inputEmit: 0,
-        TracePhase.inputQueue: 10,
-        TracePhase.inputSend: 20,
-        TracePhase.inputWire: 30,
-        TracePhase.inputDispatch: 40,
-        TracePhase.inputInject: 50,
-        TracePhase.inputPaint: 60,
-    ]
+        static func tid(for rowKind: String) -> Int {
+            switch rowKind {
+            case TraceRowKind.frame: return frames
+            case TraceRowKind.input: return input
+            case TraceRowKind.ping: return ping
+            default: return 0
+            }
+        }
+
+        static let names: [(Int, String)] = [
+            (frames, "frames"),
+            (input, "input"),
+            (ping, "ping / pong"),
+        ]
+    }
 
     /// Convert a merged session to Chrome Trace JSON for ui.perfetto.dev.
     static func chromeTrace(from session: TraceSession) -> ChromeTraceFile {
@@ -131,8 +134,9 @@ enum TraceExporter {
     }
 
     static func chromeTraceRelative(from session: TraceSession) -> ChromeTraceFile {
-        let export = trimmedForPerfetto(session)
-        let origin = export.allSpans.map(\.startMs).min() ?? export.startedAtMs
+        var spans = session.allSpans
+        spans.append(contentsOf: synthesizeMissingTransitSpans(in: spans))
+        let origin = spans.map(\.startMs).min() ?? session.startedAtMs
         var events: [ChromeTraceEvent] = []
         events.append(ChromeTraceEvent(
             name: "session_start",
@@ -144,83 +148,50 @@ enum TraceExporter {
             tid: 0,
             args: ["sessionId": session.sessionId]))
 
-        // Merge Mac + iPad spans onto one row per frame / input id.
-        var rows: [String: [TraceSpan]] = [:]
-        for span in export.allSpans {
-            let key = "\(span.rowKind):\(span.rowId)"
-            rows[key, default: []].append(span)
+        for (tid, label) in Track.names {
+            events.append(ChromeTraceEvent(
+                name: "thread_name", cat: "__metadata", ph: "M", ts: 0, dur: nil,
+                pid: pipelinePid, tid: tid, args: ["name": label]))
         }
-        let sortedKeys = rows.keys.sorted { a, b in
-            let ap = a.split(separator: ":", maxSplits: 1)
-            let bp = b.split(separator: ":", maxSplits: 1)
-            guard ap.count == 2, bp.count == 2 else { return a < b }
-            if ap[0] != bp[0] { return ap[0] < bp[0] }
-            let aid = Int(ap[1]) ?? 0
-            let bid = Int(bp[1]) ?? 0
-            return aid < bid
+
+        let ordered = spans.sorted {
+            if $0.startMs != $1.startMs { return $0.startMs < $1.startMs }
+            return ($0.rowKind, $0.rowId, $0.phase) < ($1.rowKind, $1.rowId, $1.phase)
         }
-        for key in sortedKeys {
-            guard var spans = rows[key] else { continue }
-            if key.hasPrefix("\(TraceRowKind.frame):") {
-                let rowId = Int(key.split(separator: ":").last ?? "") ?? 0
-                if let synthetic = synthesizeTransitSpan(rowId: rowId, spans: spans) {
-                    spans.append(synthetic)
-                }
-            }
-            let ordered = spans.sorted {
-                let lo = phaseOrder[$0.phase] ?? 999
-                let ro = phaseOrder[$1.phase] ?? 999
-                if lo != ro { return lo < ro }
-                return $0.startMs < $1.startMs
-            }
-            for span in ordered {
-                events.append(relativeSlice(span, origin: origin))
-            }
+        for span in ordered {
+            events.append(relativeSlice(span, origin: origin))
         }
-        events.append(contentsOf: pipelineThreadNames(session: export))
+
+        let inputIds = Set(spans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId))
+        let frameIds = Set(spans.filter { $0.rowKind == TraceRowKind.frame }.map(\.rowId))
+        let pingIds = Set(spans.filter { $0.rowKind == TraceRowKind.ping }.map(\.rowId))
         var metadata: [String: String] = [
-            "opendisplay_session": export.sessionId,
+            "opendisplay_session": session.sessionId,
             "origin_ms": String(origin),
-            "layout": "pipeline_merged",
+            "time_base": "mac_unified_ms",
+            "layout": "three_track",
         ]
-        let totalInput = Set(session.allSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId)).count
-        let exportedInput = Set(export.allSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId)).count
-        if totalInput > 0 {
-            metadata["input_rows_total"] = String(totalInput)
-            metadata["input_rows_exported"] = String(exportedInput)
-            metadata["input_export_tail"] = String(inputExportRowLimit)
-        }
+        if !inputIds.isEmpty { metadata["input_events"] = String(inputIds.count) }
+        if !frameIds.isEmpty { metadata["frame_events"] = String(frameIds.count) }
+        if !pingIds.isEmpty { metadata["ping_samples"] = String(pingIds.count) }
         return ChromeTraceFile(traceEvents: events, metadata: metadata)
     }
 
-    /// Keep all frame rows; for input rows export only the last N (by row id).
-    static func trimmedForPerfetto(_ session: TraceSession) -> TraceSession {
-        let inputIds = Set(session.allSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId))
-        guard inputIds.count > inputExportRowLimit else { return session }
-        let keep = Set(inputIds.sorted().suffix(inputExportRowLimit))
-        func keepSpan(_ span: TraceSpan) -> Bool {
-            span.rowKind != TraceRowKind.input || keep.contains(span.rowId)
-        }
-        return TraceSession(
-            sessionId: session.sessionId,
-            startedAtMs: session.startedAtMs,
-            endedAtMs: session.endedAtMs,
-            clockOffsetMs: session.clockOffsetMs,
-            maxFrames: session.maxFrames,
-            macSpans: session.macSpans.filter(keepSpan),
-            ipadSpans: session.ipadSpans.filter(keepSpan),
-            notes: session.notes + ["perfetto export: last \(inputExportRowLimit) of \(inputIds.count) input rows"])
-    }
-
-    /// Row → Perfetto thread id. One tid per frame / per input event.
-    static func rowThreadId(kind: String, rowId: Int) -> Int {
-        switch kind {
-        case TraceRowKind.input: return 1_000_000 + rowId
-        default: return rowId
-        }
-    }
-
     /// When `frame.tcp_tx` was missing (legacy ordering bug), infer from send→recv.
+    private static func synthesizeMissingTransitSpans(in spans: [TraceSpan]) -> [TraceSpan] {
+        var byFrame: [Int: [TraceSpan]] = [:]
+        for span in spans where span.rowKind == TraceRowKind.frame {
+            byFrame[span.rowId, default: []].append(span)
+        }
+        var out: [TraceSpan] = []
+        for (rowId, group) in byFrame {
+            if let synthetic = synthesizeTransitSpan(rowId: rowId, spans: group) {
+                out.append(synthetic)
+            }
+        }
+        return out
+    }
+
     private static func synthesizeTransitSpan(rowId: Int, spans: [TraceSpan]) -> TraceSpan? {
         guard !spans.contains(where: { $0.phase == TracePhase.frameTcpTransit }) else { return nil }
         guard let send = spans.first(where: { $0.phase == TracePhase.frameTcpSend }),
@@ -236,49 +207,19 @@ enum TraceExporter {
         switch phase {
         case TracePhase.frameSck, TracePhase.frameEncodeWait, TracePhase.frameEncode,
              TracePhase.frameTcpSend, TracePhase.frameDropped,
-             TracePhase.inputDispatch, TracePhase.inputInject, TracePhase.inputPaint:
+             TracePhase.inputDispatch, TracePhase.inputInject, TracePhase.inputPaint,
+             TracePhase.pingMac:
             return "mac"
         case TracePhase.frameTcpTransit, TracePhase.frameRecv, TracePhase.frameDisplay,
              TracePhase.framePresent,
-             TracePhase.inputOs, TracePhase.inputEmit, TracePhase.inputQueue, TracePhase.inputSend:
+             TracePhase.inputOs, TracePhase.inputEmit, TracePhase.inputQueue, TracePhase.inputSend,
+             TracePhase.pingRtt:
             return "ipad"
         case TracePhase.inputWire:
             return "wire"
         default:
             return "wire"
         }
-    }
-
-    private static func pipelineThreadNames(session: TraceSession) -> [ChromeTraceEvent] {
-        var names = Set<String>()
-        var out: [ChromeTraceEvent] = []
-        func nameEvent(tid: Int, label: String) {
-            let key = "\(tid)"
-            guard !names.contains(key) else { return }
-            names.insert(key)
-            out.append(ChromeTraceEvent(
-                name: "thread_name", cat: "__metadata", ph: "M", ts: 0, dur: nil,
-                pid: pipelinePid, tid: tid, args: ["name": label]))
-        }
-        var frameIds = Set<Int>()
-        var inputIds = Set<Int>()
-        for span in session.allSpans {
-            if span.rowKind == TraceRowKind.input {
-                inputIds.insert(span.rowId)
-            } else {
-                frameIds.insert(span.rowId)
-            }
-        }
-        for id in frameIds.sorted() {
-            nameEvent(tid: rowThreadId(kind: TraceRowKind.frame, rowId: id),
-                      label: "frame_\(id)")
-        }
-        for id in inputIds.sorted() {
-            nameEvent(tid: rowThreadId(kind: TraceRowKind.input, rowId: id),
-                      label: "input_\(id)")
-        }
-        nameEvent(tid: 0, label: "OpenDisplay pipeline")
-        return out
     }
 
     private static func relativeSlice(_ span: TraceSpan, origin: Double) -> ChromeTraceEvent {
@@ -296,7 +237,7 @@ enum TraceExporter {
             ts: tsUs,
             dur: durUs,
             pid: pipelinePid,
-            tid: rowThreadId(kind: span.rowKind, rowId: span.rowId),
+            tid: Track.tid(for: span.rowKind),
             args: args)
     }
 

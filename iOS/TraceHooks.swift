@@ -11,6 +11,7 @@ enum IPadTrace {
     private static var sendTrace: ((_ msg: [String: Any]) -> Void)?
     private static var streamBuffer: [TraceSpan] = []
     private static var streamSeq = 0
+    private static var pingSeq = 0
     private static var clockOffsetMs: Double = 0
     private static var displayedFrameIds: Set<Int> = []
     private static var recvStartMsByFrame: [Int: Double] = [:]
@@ -24,6 +25,7 @@ enum IPadTrace {
         sendMsByFrame.removeAll(keepingCapacity: true)
         streamBuffer.removeAll(keepingCapacity: true)
         streamSeq = 0
+        pingSeq = 0
         sendTrace = nil
     }
 
@@ -133,6 +135,24 @@ enum IPadTrace {
         send(msg)
     }
 
+    /// Full control-channel RTT (iPad ping sent → pong received), Mac-unified clock.
+    static func recordPong(pingTDev: Double, pongTDev: Double, rttMs: Double) {
+        guard TraceCollector.shared.tracesInput else { return }
+        lock.lock()
+        pingSeq += 1
+        let id = pingSeq
+        lock.unlock()
+        let start = TraceCollector.shared.ipadUnifiedMs(wallMs: pingTDev)
+        let end = TraceCollector.shared.ipadUnifiedMs(wallMs: pongTDev)
+        let span = TraceSpan(rowKind: TraceRowKind.ping, rowId: id, phase: TracePhase.pingRtt,
+                               startMs: start, endMs: end,
+                               meta: ["rtt_ms": String(format: "%.2f", rttMs)])
+        TraceCollector.shared.span(TracePhase.pingRtt, rowKind: TraceRowKind.ping,
+                                   rowId: id, startMs: start, endMs: end,
+                                   side: .ipad, meta: span.meta)
+        enqueueStream([span])
+    }
+
     static func noteSendMs(_ frameId: Int, sendMs: Double, clockOffsetMs: Double) {
         guard TraceCollector.shared.tracesFrames else { return }
         lock.lock()
@@ -148,8 +168,12 @@ enum IPadTrace {
         let sendMs = sendMsByFrame[frameId]
         lock.unlock()
         if let sendMs {
+            let span = TraceSpan(rowKind: TraceRowKind.frame, rowId: frameId,
+                                 phase: TracePhase.frameTcpTransit,
+                                 startMs: sendMs, endMs: ms, meta: nil)
             TraceCollector.shared.span(TracePhase.frameTcpTransit, rowKind: TraceRowKind.frame,
                                        rowId: frameId, startMs: sendMs, endMs: ms, side: .ipad)
+            if TraceCollector.shared.tracesInput { enqueueStream([span]) }
         }
     }
 
@@ -160,9 +184,12 @@ enum IPadTrace {
         let recv = recvStartMsByFrame[frameId] ?? mid
         parseDoneMsByFrame[frameId] = mid
         lock.unlock()
+        let span = TraceSpan(rowKind: TraceRowKind.frame, rowId: frameId, phase: TracePhase.frameRecv,
+                             startMs: recv, endMs: mid, meta: ["leg": "recv_to_sample"])
         TraceCollector.shared.span(TracePhase.frameRecv, rowKind: TraceRowKind.frame,
                                    rowId: frameId, startMs: recv, endMs: mid, side: .ipad,
-                                   meta: ["leg": "recv_to_sample"])
+                                   meta: span.meta)
+        if TraceCollector.shared.tracesInput { enqueueStream([span]) }
     }
 
     static func frameDisplayed(_ frameId: Int) {
@@ -175,9 +202,12 @@ enum IPadTrace {
         sendMsByFrame.removeValue(forKey: frameId)
         displayedFrameIds.insert(frameId)
         lock.unlock()
+        let span = TraceSpan(rowKind: TraceRowKind.frame, rowId: frameId, phase: TracePhase.frameDisplay,
+                             startMs: start, endMs: end, meta: ["leg": "sample_to_enqueue"])
         TraceCollector.shared.span(TracePhase.frameDisplay, rowKind: TraceRowKind.frame,
                                    rowId: frameId, startMs: start, endMs: end, side: .ipad,
-                                   meta: ["leg": "sample_to_enqueue"])
+                                   meta: span.meta)
+        if TraceCollector.shared.tracesInput { enqueueStream([span]) }
     }
 
     static func finishUpload(send: @escaping (_ msg: [String: Any]) -> Void) {

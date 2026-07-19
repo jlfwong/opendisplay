@@ -88,7 +88,10 @@ final class TraceCollector {
     var tracesFrames: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return active && mode == .frame && frameBudget > 0
+        guard active else { return false }
+        // Input sessions (pen down→up) also capture the video pipeline on the frames track.
+        if mode == .input { return true }
+        return mode == .frame && frameBudget > 0
     }
 
     var tracesInput: Bool {
@@ -126,7 +129,9 @@ final class TraceCollector {
     func consumeFrameBudget() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard active, mode == .frame, frameBudget > 0 else { return false }
+        guard active else { return false }
+        if mode == .input { return true }
+        guard mode == .frame, frameBudget > 0 else { return false }
         frameBudget -= 1
         if frameBudget == 0 {
             notes.append("frame budget exhausted")

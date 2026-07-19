@@ -962,8 +962,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Echo with our clock so the phone can estimate the offset
             // (NTP-style) and compute true end-to-end frame latency.
             if let t = obj["t"] as? Double {
-                let mt = Date().timeIntervalSince1970 * 1000
-                sendJSONFrame("{\"type\":\"pong\",\"t\":\(t),\"mt\":\(mt)}")
+                let recvMs = Date().timeIntervalSince1970 * 1000
+                sendJSONFrame("{\"type\":\"pong\",\"t\":\(t),\"mt\":\(recvMs)}")
+                let pongMs = Date().timeIntervalSince1970 * 1000
+                MacTrace.recordPingMac(recvMs: recvMs, pongMs: pongMs)
             }
         case "stats":
             // Aggregated pipeline health measured on the phone — logged here
