@@ -1,11 +1,12 @@
-// InputCapture: Apple Pencil + multi-touch with full fidelity, mapped into
-// normalized video-space coordinates by the host view.
+// InputCaptureEngine: Apple Pencil + multi-touch with full fidelity.
+// Installed on VideoView (not a separate overlay) so hit-testing matches
+// the pre-port behavior that finger touches relied on.
 
 import UIKit
 
-/// Captures pencil, hover, and gesture input on a transparent overlay.
-/// Coordinates are normalized [0,1] in video space (origin top-left).
-final class InputCaptureView: UIView {
+/// Captures pencil, hover, and gesture input. Coordinates are normalized
+/// [0,1] in video space (origin top-left) via the host view's normalize closure.
+final class InputCaptureEngine: NSObject {
     var onTouch: ((_ phase: String, _ x: Double, _ y: Double) -> Void)?
     var onPencil: ((_ phase: PencilPhase, _ x: Double, _ y: Double,
                     _ pressure: Double, _ azimuth: Double, _ altitude: Double,
@@ -14,48 +15,49 @@ final class InputCaptureView: UIView {
     var onGesture: ((_ kind: GestureKind, _ state: GestureState,
                      _ scale: Double?, _ velocity: Double?,
                      _ x: Double?, _ y: Double?, _ fingerCount: Int?) -> Void)?
-    var onBarrelButton: ((_ down: Bool, _ x: Double, _ y: Double) -> Void)?
 
-    /// Map a point in this view to normalized video coordinates.
+    /// Map a point in the host view to normalized video coordinates.
     var normalize: ((CGPoint) -> (x: Double, y: Double)?)?
 
+    private weak var hostView: UIView?
     private var activePens: Set<UInt64> = []
     private var hoverInRange = false
     private var activeFingerTouches: Set<ObjectIdentifier> = []
     private var penStrokes: [UInt64: PenStroke] = [:]
     private let tapMoveThreshold: CGFloat = 8
     private var gestureActive = false
+    private var lastFingerNorm: (x: Double, y: Double)?
 
     private struct PenStroke {
         var start: CGPoint
         var sentDown: Bool
     }
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        backgroundColor = .clear
-        isMultipleTouchEnabled = true
+    func install(on view: UIView) {
+        hostView = view
+        view.isMultipleTouchEnabled = true
 
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
         hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
-        addGestureRecognizer(hover)
+        view.addGestureRecognizer(hover)
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinchChanged(_:)))
         pinch.allowedTouchTypes = [UITouch.TouchType.direct.rawValue as NSNumber]
-        addGestureRecognizer(pinch)
+        pinch.cancelsTouchesInView = false
+        view.addGestureRecognizer(pinch)
 
         let twoFingerTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTapped(_:)))
         twoFingerTap.numberOfTouchesRequired = 2
         twoFingerTap.numberOfTapsRequired = 1
-        addGestureRecognizer(twoFingerTap)
+        twoFingerTap.cancelsTouchesInView = false
+        view.addGestureRecognizer(twoFingerTap)
 
         let threeFingerTap = UITapGestureRecognizer(target: self, action: #selector(threeFingerTapped(_:)))
         threeFingerTap.numberOfTouchesRequired = 3
         threeFingerTap.numberOfTapsRequired = 1
-        addGestureRecognizer(threeFingerTap)
+        threeFingerTap.cancelsTouchesInView = false
+        view.addGestureRecognizer(threeFingerTap)
     }
-
-    required init?(coder: NSCoder) { fatalError() }
 
     private func norm(_ p: CGPoint) -> (Double, Double)? {
         guard let n = normalize?(p) else { return nil }
@@ -63,13 +65,14 @@ final class InputCaptureView: UIView {
     }
 
     private func gestureCentroid(_ gr: UIGestureRecognizer) -> (Double, Double)? {
+        guard let view = hostView else { return nil }
         guard gr.numberOfTouches > 0 else {
-            return norm(gr.location(in: self)).map { ($0.0, $0.1) }
+            return norm(gr.location(in: view)).map { ($0.0, $0.1) }
         }
         var sum = CGPoint.zero
         for i in 0..<gr.numberOfTouches {
-            sum.x += gr.location(ofTouch: i, in: self).x
-            sum.y += gr.location(ofTouch: i, in: self).y
+            sum.x += gr.location(ofTouch: i, in: view).x
+            sum.y += gr.location(ofTouch: i, in: view).y
         }
         sum.x /= CGFloat(gr.numberOfTouches)
         sum.y /= CGFloat(gr.numberOfTouches)
@@ -79,8 +82,8 @@ final class InputCaptureView: UIView {
     // MARK: - Hover (pen in air)
 
     @objc private func hoverChanged(_ gr: UIHoverGestureRecognizer) {
-        guard activePens.isEmpty else { return }
-        guard let (nx, ny) = norm(gr.location(in: self)) else { return }
+        guard activePens.isEmpty, let view = hostView else { return }
+        guard let (nx, ny) = norm(gr.location(in: view)) else { return }
         switch gr.state {
         case .began, .changed:
             if !hoverInRange {
@@ -101,45 +104,49 @@ final class InputCaptureView: UIView {
     // MARK: - Touch (pen / finger on screen)
 
     private func trackFingerTouches(_ touches: Set<UITouch>, ended: Bool) {
-        for touch in touches where touch.type == .direct {
+        for touch in touches where isFinger(touch) {
             let key = ObjectIdentifier(touch)
             if ended { activeFingerTouches.remove(key) }
             else { activeFingerTouches.insert(key) }
         }
     }
 
-    private func handle(_ touches: Set<UITouch>, event: UIEvent?, phase: String, ended: Bool) {
-        if gestureActive || (event?.allTouches?.count ?? 1) > 1 {
-            if phase != "began", let last = lastFingerNorm {
-                onTouch?("cancelled", last.x, last.y)
-            }
-            return
+    private func isFinger(_ touch: UITouch) -> Bool {
+        switch touch.type {
+        case .direct: return true
+        default:
+            if #available(iOS 17.0, *), touch.type == .indirectPointer { return true }
+            return false
         }
+    }
 
+    func handle(_ touches: Set<UITouch>, event: UIEvent?, phase: String, ended: Bool) {
         trackFingerTouches(touches, ended: ended)
+        let blockFinger = gestureActive || activeFingerTouches.count > 1
+        if blockFinger, phase != "began", let last = lastFingerNorm {
+            onTouch?("cancelled", last.x, last.y)
+        }
 
         for touch in touches {
             switch touch.type {
             case .pencil, .stylus:
                 emitPen(touch, event: event, ended: ended)
-            case .direct:
-                guard activeFingerTouches.count <= 1 else { continue }
-                emitFinger(touch, event: event, phase: phase)
             default:
-                break
+                guard isFinger(touch) else { continue }
+                guard !blockFinger, activeFingerTouches.count <= 1 else { continue }
+                emitFinger(touch, event: event, phase: phase)
             }
         }
     }
 
-    private var lastFingerNorm: (x: Double, y: Double)?
-
     private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool) {
+        guard let view = hostView else { return }
         let id = UInt64(bitPattern: Int64(ObjectIdentifier(touch).hashValue))
-        let loc = touch.location(in: self)
+        let loc = touch.location(in: view)
         guard let (nx, ny) = norm(loc) else { return }
 
         let pressure = min(Double(touch.force), 1.0)
-        let azimuth = Double(touch.azimuthAngle(in: self))
+        let azimuth = Double(touch.azimuthAngle(in: view))
         let altitude = Double(touch.altitudeAngle)
 
         var rotationDeg: Double = 0
@@ -174,10 +181,10 @@ final class InputCaptureView: UIView {
             }
             onPencil?(.move, nx, ny, pressure, azimuth, altitude, rotationDeg)
             for c in event?.coalescedTouches(for: touch) ?? [] where c !== touch {
-                guard let (cx, cy) = norm(c.location(in: self)) else { continue }
+                guard let (cx, cy) = norm(c.location(in: view)) else { continue }
                 onPencil?(.move, cx, cy,
                            min(Double(c.force), 1.0),
-                           Double(c.azimuthAngle(in: self)),
+                           Double(c.azimuthAngle(in: view)),
                            Double(c.altitudeAngle),
                            rotationDeg)
             }
@@ -191,8 +198,9 @@ final class InputCaptureView: UIView {
         }
 
         if let stroke = penStrokes[id], !stroke.sentDown {
-            onBarrelButton?(true, nx, ny)
-            onBarrelButton?(false, nx, ny)
+            // Short tap → left click (tablet down/up), not right click.
+            onPencil?(.down, nx, ny, pressure, azimuth, altitude, rotationDeg)
+            onPencil?(.up, nx, ny, 0, azimuth, altitude, rotationDeg)
             return
         }
 
@@ -200,19 +208,20 @@ final class InputCaptureView: UIView {
     }
 
     private func emitFinger(_ touch: UITouch, event: UIEvent?, phase: String) {
+        guard let view = hostView else { return }
         if phase == "moved", let event {
             for t in event.coalescedTouches(for: touch) ?? [touch] {
-                guard let n = norm(t.location(in: self)) else { continue }
+                guard let n = norm(t.location(in: view)) else { continue }
                 lastFingerNorm = (x: n.0, y: n.1)
                 onTouch?("moved", n.0, n.1)
             }
             if let predicted = event.predictedTouches(for: touch)?.last,
-               let n = norm(predicted.location(in: self)) {
+               let n = norm(predicted.location(in: view)) {
                 onTouch?("moved", n.0, n.1)
             }
             return
         }
-        guard let n = norm(touch.location(in: self)) else { return }
+        guard let n = norm(touch.location(in: view)) else { return }
         lastFingerNorm = (x: n.0, y: n.1)
         onTouch?(phase, n.0, n.1)
     }
@@ -247,18 +256,5 @@ final class InputCaptureView: UIView {
         case .cancelled: return .cancelled
         default: return .changed
         }
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        handle(touches, event: event, phase: "began", ended: false)
-    }
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        handle(touches, event: event, phase: "moved", ended: false)
-    }
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        handle(touches, event: event, phase: "ended", ended: true)
-    }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        handle(touches, event: event, phase: "cancelled", ended: true)
     }
 }

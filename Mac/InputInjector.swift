@@ -297,6 +297,9 @@ final class InputInjector {
         ev.setDoubleValueField(.tabletEventTiltX, value: tiltX)
         ev.setDoubleValueField(.tabletEventTiltY, value: tiltY)
         ev.setDoubleValueField(.tabletEventRotation, value: rotation)
+        if phase == .down || phase == .up {
+            ev.setIntegerValueField(.mouseEventClickState, value: 1)
+        }
         ev.post(tap: .cghidEventTap)
     }
 

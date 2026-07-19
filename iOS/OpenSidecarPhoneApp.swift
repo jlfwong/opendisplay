@@ -635,35 +635,23 @@ struct VideoLayerView: UIViewRepresentable {
             view.layer.addSublayer(displayLayer)
         }
 
-        let capture = InputCaptureView(frame: .zero)
-        capture.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(capture)
-        NSLayoutConstraint.activate([
-            capture.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            capture.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            capture.topAnchor.constraint(equalTo: view.topAnchor),
-            capture.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
-        view.inputCapture = capture
-        capture.normalize = { [weak view] point in view?.normalized(point) }
-        capture.onTouch = { [weak receiver] phase, x, y in
+        view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
+        view.inputEngine.onTouch = { [weak receiver] phase, x, y in
             receiver?.sendTouch(phase: phase, x: x, y: y)
         }
-        capture.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation in
+        view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation in
             receiver?.sendPencil(phase: phase, x: x, y: y,
                                  pressure: pressure, azimuth: azimuth,
                                  altitude: altitude, rotation: rotation)
         }
-        capture.onProximity = { [weak receiver] entering, eraser in
+        view.inputEngine.onProximity = { [weak receiver] entering, eraser in
             receiver?.sendProximity(entering: entering, eraser: eraser)
         }
-        capture.onGesture = { [weak receiver] kind, state, scale, velocity, x, y, fingerCount in
+        view.inputEngine.onGesture = { [weak receiver] kind, state, scale, velocity, x, y, fingerCount in
             receiver?.sendGesture(kind: kind, state: state, scale: scale,
                                   velocity: velocity, x: x, y: y, fingerCount: fingerCount)
         }
-        capture.onBarrelButton = { [weak receiver] down, x, y in
-            receiver?.sendBarrelButton(down: down, x: x, y: y)
-        }
+        view.inputEngine.install(on: view)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -684,7 +672,7 @@ struct VideoLayerView: UIViewRepresentable {
     final class VideoView: UIView {
         weak var receiver: PhoneReceiver?
         var metalRenderer: MetalVideoRenderer?
-        var inputCapture: InputCaptureView?
+        let inputEngine = InputCaptureEngine()
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -781,6 +769,19 @@ struct VideoLayerView: UIViewRepresentable {
             let x = (point.x - origin.x) / size.width
             let y = (point.y - origin.y) / size.height
             return (min(max(x, 0), 1), min(max(y, 0), 1))
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            inputEngine.handle(touches, event: event, phase: "began", ended: false)
+        }
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            inputEngine.handle(touches, event: event, phase: "moved", ended: false)
+        }
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            inputEngine.handle(touches, event: event, phase: "ended", ended: true)
+        }
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            inputEngine.handle(touches, event: event, phase: "cancelled", ended: true)
         }
     }
 }
