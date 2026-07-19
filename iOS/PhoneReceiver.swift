@@ -66,6 +66,7 @@ final class PhoneReceiver: ObservableObject {
     private var listenerHealthy = false
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "receiver.video")
+    private static let queueKey = DispatchSpecificKey<UInt8>()
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
     private var sps: Data?
@@ -230,6 +231,7 @@ final class PhoneReceiver: ObservableObject {
     init(displayLayer: AVSampleBufferDisplayLayer) {
         self.displayLayer = displayLayer
         displayLayer.videoGravity = .resizeAspect
+        queue.setSpecific(key: Self.queueKey, value: 1)
     }
 
     func start(port: UInt16 = 9000) {
@@ -472,33 +474,35 @@ final class PhoneReceiver: ObservableObject {
     func sendPencil(phase: PencilPhase, x: Double, y: Double,
                     pressure: Double, azimuth: Double, altitude: Double,
                     rotation: Double) {
-        if phase == .down {
-            IPadTrace.beginOnPenDown(clockOffsetMs: clockOffsetMs) { [weak self] msg in
-                self?.sendControl(msg)
-            }
-        }
-        let devMs = nowMs
-        let macMs = clockOffsetMs.map { devMs + $0 }
-        var inpId: Int?
-        // Trace input rows on down/up only — move floods memory and control messages.
-        if TraceCollector.shared.isActive, phase == .down || phase == .up {
-            let id = IPadTrace.nextInputId()
-            inpId = id
-            IPadTrace.noteInputEmit(inputId: id, devWallMs: devMs)
-        }
-        var msg: [String: Any] = [
-            "type": WireInput.pencil,
-            "phase": phase.rawValue,
-            "x": x, "y": y,
-            "pressure": pressure,
-            "azimuth": azimuth,
-            "altitude": altitude,
-            "rotation": rotation,
-            "tDev": devMs,
-        ]
-        if let macMs { msg["t"] = macMs }
-        if let inpId { msg["inpId"] = inpId }
+        // Pencil callbacks arrive on the main thread; trace + NWConnection must
+        // stay on the receiver queue to avoid Dictionary races with frame recv.
         queue.async {
+            if phase == .down {
+                IPadTrace.beginOnPenDown(clockOffsetMs: self.clockOffsetMs) { msg in
+                    self.sendControl(msg)
+                }
+            }
+            let devMs = self.nowMs
+            let macMs = self.clockOffsetMs.map { devMs + $0 }
+            var inpId: Int?
+            // Trace input rows on down/up only — move floods memory and control messages.
+            if TraceCollector.shared.isActive, phase == .down || phase == .up {
+                let id = IPadTrace.nextInputId()
+                inpId = id
+                IPadTrace.noteInputEmit(inputId: id, devWallMs: devMs)
+            }
+            var msg: [String: Any] = [
+                "type": WireInput.pencil,
+                "phase": phase.rawValue,
+                "x": x, "y": y,
+                "pressure": pressure,
+                "azimuth": azimuth,
+                "altitude": altitude,
+                "rotation": rotation,
+                "tDev": devMs,
+            ]
+            if let macMs { msg["t"] = macMs }
+            if let inpId { msg["inpId"] = inpId }
             if phase != .hover, let macMs {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
@@ -574,7 +578,8 @@ final class PhoneReceiver: ObservableObject {
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {
-        queue.async {
+        let send = { [weak self] in
+            guard let self else { return }
             guard let conn = conn ?? self.connection,
                   let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
             var header = UInt32(payload.count).bigEndian
@@ -583,6 +588,11 @@ final class PhoneReceiver: ObservableObject {
             conn.send(content: frame, completion: .contentProcessed { error in
                 if let error { Log.info("control send error: \(error)") }
             })
+        }
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            send()
+        } else {
+            queue.async(execute: send)
         }
     }
 
