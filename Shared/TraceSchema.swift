@@ -7,6 +7,8 @@ enum WireTrace {
     static let traceStart = "traceStart"
     static let traceStop = "traceStop"
     static let traceUpload = "traceUpload"
+    static let traceSpan = "traceSpan"
+    static let traceEnd = "traceEnd"
     static let traceReady = "traceReady"
 }
 

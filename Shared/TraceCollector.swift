@@ -59,6 +59,8 @@ final class TraceCollector {
         notes.removeAll(keepingCapacity: true)
         frameMarks.removeAll(keepingCapacity: true)
         inputMarks.removeAll(keepingCapacity: true)
+        lastIngestSeq = 0
+        ipadSpanKeys.removeAll(keepingCapacity: true)
         notes.append("session started mode=\(mode.rawValue) maxFrames=\(maxFrames) maxInputs=\(maxInputs)")
         return true
     }
@@ -253,10 +255,35 @@ final class TraceCollector {
             notes: notes)
     }
 
-    func ingestIPadSpans(_ spans: [TraceSpan]) {
+    func ingestIPadSpans(_ spans: [TraceSpan], seq: Int = 0) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        ipadSpans.append(contentsOf: spans)
+        guard active, !spans.isEmpty else { return 0 }
+        if seq > 0, seq <= lastIngestSeq { return 0 }
+        if seq > 0 { lastIngestSeq = seq }
+        var added = 0
+        for span in spans {
+            guard macSpans.count + ipadSpans.count < maxSpans else { break }
+            let key = spanKey(span)
+            if ipadSpanKeys.contains(key) { continue }
+            ipadSpanKeys.insert(key)
+            ipadSpans.append(span)
+            added += 1
+        }
+        return added
+    }
+
+    func appendNote(_ note: String) {
+        lock.lock()
+        notes.append(note)
+        lock.unlock()
+    }
+
+    private var lastIngestSeq = 0
+    private var ipadSpanKeys: Set<String> = []
+
+    private func spanKey(_ span: TraceSpan) -> String {
+        "\(span.rowKind)|\(span.rowId)|\(span.phase)"
     }
 }
 
@@ -265,15 +292,47 @@ final class TraceCollector {
 enum TraceWire {
 
     static func startMessage(sessionId: String, mode: TraceMode,
-                             maxFrames: Int, maxInputs: Int) -> [String: Any] {
-        [
+                             maxFrames: Int, maxInputs: Int,
+                             tDev: Double? = nil, tMac: Double? = nil) -> [String: Any] {
+        var msg: [String: Any] = [
             "type": WireTrace.traceStart,
             "sessionId": sessionId,
             "mode": mode.rawValue,
             "maxFrames": maxFrames,
             "maxInputs": maxInputs,
-            "tDev": Date().timeIntervalSince1970 * 1000,
+            "tDev": tDev ?? Date().timeIntervalSince1970 * 1000,
         ]
+        if let tMac { msg["t"] = tMac }
+        return msg
+    }
+
+    /// Incremental iPad span batch — Mac persists as spans arrive.
+    static func spanBatchMessage(sessionId: String, seq: Int, spans: [TraceSpan],
+                                 tDev: Double, tMac: Double?) -> [String: Any]? {
+        guard let data = try? JSONEncoder().encode(spans),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        var msg: [String: Any] = [
+            "type": WireTrace.traceSpan,
+            "sessionId": sessionId,
+            "seq": seq,
+            "spans": json,
+            "tDev": tDev,
+        ]
+        if let tMac { msg["t"] = tMac }
+        return msg
+    }
+
+    static func endMessage(sessionId: String, tDev: Double, tMac: Double?,
+                           inputRows: Int, spanSeq: Int) -> [String: Any] {
+        var msg: [String: Any] = [
+            "type": WireTrace.traceEnd,
+            "sessionId": sessionId,
+            "tDev": tDev,
+            "inputRows": inputRows,
+            "spanSeq": spanSeq,
+        ]
+        if let tMac { msg["t"] = tMac }
+        return msg
     }
 
     static func uploadMessage(sessionId: String, spans: [TraceSpan]) -> [String: Any]? {
@@ -286,6 +345,31 @@ enum TraceWire {
         ]
     }
 
+    static func decodeSpanBatch(_ obj: [String: Any]) -> (sessionId: String, seq: Int, spans: [TraceSpan])? {
+        guard let type = obj["type"] as? String, type == WireTrace.traceSpan,
+              let sessionId = obj["sessionId"] as? String,
+              let seq = obj["seq"] as? Int else { return nil }
+        if let json = obj["spans"] as? String,
+           let data = json.data(using: .utf8),
+           let spans = try? JSONDecoder().decode([TraceSpan].self, from: data) {
+            return (sessionId, seq, spans)
+        }
+        if let arr = obj["spans"] as? [[String: Any]] {
+            let data = try? JSONSerialization.data(withJSONObject: arr)
+            if let data, let spans = try? JSONDecoder().decode([TraceSpan].self, from: data) {
+                return (sessionId, seq, spans)
+            }
+        }
+        return nil
+    }
+
+    static func decodeEnd(_ obj: [String: Any]) -> (sessionId: String, inputRows: Int, spanSeq: Int)? {
+        guard let type = obj["type"] as? String, type == WireTrace.traceEnd,
+              let sessionId = obj["sessionId"] as? String else { return nil }
+        let inputRows = obj["inputRows"] as? Int ?? 0
+        let spanSeq = obj["spanSeq"] as? Int ?? 0
+        return (sessionId, inputRows, spanSeq)
+    }
     static func decodeUpload(_ obj: [String: Any]) -> (sessionId: String, spans: [TraceSpan])? {
         guard let type = obj["type"] as? String, type == WireTrace.traceUpload,
               let sessionId = obj["sessionId"] as? String else { return nil }
@@ -306,13 +390,28 @@ enum TraceWire {
 
 enum TraceFileWriter {
 
+    private static let checkpointSpanInterval = 150
+
     /// Write Perfetto-loadable JSON + raw session JSON under `/tmp`.
-    static func write(session: TraceSession) throws -> (perfetto: URL, raw: URL) {
+    static func write(session: TraceSession, partial: Bool = false) throws -> (perfetto: URL, raw: URL) {
         let stamp = session.sessionId.prefix(8)
-        let perfettoURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp).perfetto.json")
-        let rawURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp).session.json")
+        let suffix = partial ? ".partial" : ""
+        let perfettoURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp)\(suffix).perfetto.json")
+        let rawURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp)\(suffix).session.json")
         try TraceExporter.jsonData(from: session, relativeTimeline: true).write(to: perfettoURL)
         try TraceExporter.sessionJSON(from: session).write(to: rawURL)
         return (perfettoURL, rawURL)
+    }
+
+    /// Durability checkpoint during long strokes.
+    @discardableResult
+    static func checkpointIfNeeded(session: TraceSession, ipadSpanCount: Int) -> URL? {
+        guard ipadSpanCount > 0, ipadSpanCount % checkpointSpanInterval == 0 else { return nil }
+        do {
+            let urls = try write(session: session, partial: true)
+            return urls.raw
+        } catch {
+            return nil
+        }
     }
 }

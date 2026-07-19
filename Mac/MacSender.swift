@@ -888,6 +888,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                           maxFrames: maxFrames, maxInputs: maxInputs,
                                           clockOffsetMs: offset)
             }
+        case WireTrace.traceSpan:
+            if let parsed = TraceWire.decodeSpanBatch(obj) {
+                MacTrace.handleTraceSpan(sessionId: parsed.sessionId, seq: parsed.seq, spans: parsed.spans)
+            }
+        case WireTrace.traceEnd:
+            if let parsed = TraceWire.decodeEnd(obj) {
+                MacTrace.handleTraceEnd(sessionId: parsed.sessionId,
+                                          inputRows: parsed.inputRows, spanSeq: parsed.spanSeq)
+            }
         case WireTrace.traceUpload:
             if let parsed = TraceWire.decodeUpload(obj) {
                 MacTrace.handleTraceUpload(sessionId: parsed.sessionId, spans: parsed.spans)
@@ -909,6 +918,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 MacTrace.inputDispatch(inputId: inpId, recvMs: recvMs, injectStartMs: injectStart)
                 MacTrace.inputInject(inputId: inpId, injectStartMs: injectStart,
                                      injectEndMs: injectEnd, phase: pencilPhase)
+            }
+            if type == WireInput.pencil {
+                MacTrace.pencilPhaseEnded(phase: pencilPhase)
             }
             if let t = obj["t"] as? Double {
                 let delta = Date().timeIntervalSince1970 * 1000 - t

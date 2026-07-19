@@ -2,6 +2,7 @@
 import Foundation
 
 /// Mac-side trace hooks for ScreenCaptureKit → encode → TCP.
+/// iPad spans arrive incrementally; Mac checkpoints and writes trace files locally.
 enum MacTrace {
 
     private static var frameSeq = 0
@@ -11,6 +12,10 @@ enum MacTrace {
     private static var sendStartMsByFrame: [Int: Double] = [:]
     private static var lastSendDoneMs: Double = 0
     private static var pendingPaint: [(inputId: Int, injectEndMs: Double)] = []
+    private static var lastCaptureMs: Double = 0
+    private static var finalizedSessions: Set<String> = []
+    private static var finalizeWork: DispatchWorkItem?
+    private static let finalizeQueue = DispatchQueue(label: "trace.finalize")
 
     static func handleTraceStart(sessionId: String, mode: TraceMode,
                                  maxFrames: Int, maxInputs: Int,
@@ -30,27 +35,46 @@ enum MacTrace {
         sendStartMsByFrame.removeAll()
         lastSendDoneMs = 0
         pendingPaint.removeAll()
+        lastCaptureMs = now
+        finalizedSessions.remove(sessionId)
         lock.unlock()
         Log.info("[trace] Mac session started id=\(sessionId) mode=\(mode.rawValue) maxFrames=\(maxFrames) maxInputs=\(maxInputs)")
     }
 
-    static func handleTraceUpload(sessionId: String, spans: [TraceSpan]) {
+    static func handleTraceSpan(sessionId: String, seq: Int, spans: [TraceSpan]) {
+        guard !finalizedSessions.contains(sessionId) else { return }
+        let added = TraceCollector.shared.ingestIPadSpans(spans, seq: seq)
+        guard added > 0 else { return }
         let now = Date().timeIntervalSince1970 * 1000
-        TraceCollector.shared.ingestIPadSpans(spans)
         let session = TraceCollector.shared.buildPartialSession(endedAtMs: now)
         guard session.sessionId == sessionId else {
-            Log.info("[trace] upload session mismatch got=\(sessionId) have=\(session.sessionId)")
+            Log.info("[trace] span batch session mismatch got=\(sessionId.prefix(8)) have=\(session.sessionId.prefix(8))")
             return
         }
-        do {
-            let urls = try TraceFileWriter.write(session: session)
-            Log.info("[trace] wrote Perfetto trace → \(urls.perfetto.path)")
-            Log.info("[trace] wrote raw session → \(urls.raw.path)")
-            Log.info("[trace] open https://ui.perfetto.dev and Load trace from file")
-        } catch {
-            Log.info("[trace] export failed: \(error)")
+        if let url = TraceFileWriter.checkpointIfNeeded(session: session, ipadSpanCount: session.ipadSpans.count) {
+            Log.info("[trace] checkpoint \(session.ipadSpans.count) iPad spans → \(url.path)")
         }
-        TraceCollector.shared.stop(reason: "upload merged")
+    }
+
+    static func handleTraceEnd(sessionId: String, inputRows: Int, spanSeq: Int) {
+        finalize(sessionId: sessionId, reason: "traceEnd rows=\(inputRows) spanSeq=\(spanSeq)")
+    }
+
+    /// Legacy bulk upload — still supported.
+    static func handleTraceUpload(sessionId: String, spans: [TraceSpan]) {
+        _ = TraceCollector.shared.ingestIPadSpans(spans)
+        finalize(sessionId: sessionId, reason: "traceUpload \(spans.count) spans")
+    }
+
+    static func pencilPhaseEnded(phase: String?) {
+        guard phase == "up", TraceCollector.shared.tracesInput else { return }
+        scheduleFinalize(reason: "mac pen up")
+    }
+
+    static func noteCaptureMs(_ ms: Double) {
+        lock.lock()
+        lastCaptureMs = ms
+        lock.unlock()
     }
 
     /// Returns frame id if traced; nil if inactive or budget exhausted (sends traceStop).
@@ -152,15 +176,15 @@ enum MacTrace {
     /// Close input.paint when ScreenCaptureKit delivers a frame after injection.
     static func tryCompletePaint(captureMs: Double) {
         guard TraceCollector.shared.tracesInput else { return }
+        noteCaptureMs(captureMs)
         while true {
             lock.lock()
             guard let head = pendingPaint.first else { lock.unlock(); return }
             guard captureMs >= head.injectEndMs else { lock.unlock(); return }
             let item = pendingPaint.removeFirst()
             lock.unlock()
-            let end = min(captureMs, item.injectEndMs + 200)
             TraceCollector.shared.span(TracePhase.inputPaint, rowKind: TraceRowKind.input,
-                                       rowId: item.inputId, startMs: item.injectEndMs, endMs: end,
+                                       rowId: item.inputId, startMs: item.injectEndMs, endMs: captureMs,
                                        side: .mac, meta: ["leg": "inject_to_sck"])
         }
     }
@@ -170,6 +194,65 @@ enum MacTrace {
             return "{\"cap\":\(captureMs),\"snd\":\(sendMs),\"fid\":\(frameId)}"
         }
         return "{\"cap\":\(captureMs),\"snd\":\(sendMs)}"
+    }
+
+    // MARK: - Finalize
+
+    private static func scheduleFinalize(reason: String) {
+        finalizeWork?.cancel()
+        let sessionId = TraceCollector.shared.currentSessionId
+        let work = DispatchWorkItem {
+            finalize(sessionId: sessionId, reason: reason)
+        }
+        finalizeWork = work
+        finalizeQueue.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    private static func finalize(sessionId: String, reason: String) {
+        lock.lock()
+        if finalizedSessions.contains(sessionId) {
+            lock.unlock()
+            return
+        }
+        finalizedSessions.insert(sessionId)
+        lock.unlock()
+
+        guard TraceCollector.shared.isActive,
+              TraceCollector.shared.currentSessionId == sessionId else { return }
+
+        flushPendingPaint(until: paintFlushDeadline())
+        TraceCollector.shared.appendNote("mac finalized: \(reason)")
+        let now = Date().timeIntervalSince1970 * 1000
+        let session = TraceCollector.shared.buildPartialSession(endedAtMs: now)
+        do {
+            let urls = try TraceFileWriter.write(session: session)
+            Log.info("[trace] wrote Perfetto trace → \(urls.perfetto.path)")
+            Log.info("[trace] wrote raw session → \(urls.raw.path)")
+            Log.info("[trace] open https://ui.perfetto.dev and Load trace from file")
+        } catch {
+            Log.info("[trace] export failed: \(error)")
+        }
+        TraceCollector.shared.stop(reason: reason)
+    }
+
+    private static func paintFlushDeadline() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date().timeIntervalSince1970 * 1000
+        return max(lastCaptureMs, now)
+    }
+
+    /// Close any input.paint spans still waiting for SCK at session end.
+    private static func flushPendingPaint(until endMs: Double) {
+        while true {
+            lock.lock()
+            guard let item = pendingPaint.first else { lock.unlock(); return }
+            pendingPaint.removeFirst()
+            lock.unlock()
+            TraceCollector.shared.span(TracePhase.inputPaint, rowKind: TraceRowKind.input,
+                                       rowId: item.inputId, startMs: item.injectEndMs, endMs: endMs,
+                                       side: .mac, meta: ["leg": "inject_to_sck_flush"])
+        }
     }
 }
 #endif
