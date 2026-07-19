@@ -1005,7 +1005,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                  traceFrameId: traceFrameId)
     }
 
-    /// Drop when encode or send pipeline is busy; forces keyframe to resync.
+    /// Drop when encode or send pipeline is busy.
+    /// Pre-encode drops are invisible to the decoder — the H.264 reference
+    /// chain stays intact, so the next frame can be a normal P-frame (n → n+2).
+    /// Do NOT force keyframes here; that was causing IDR pulsing / blockiness.
     private func shouldDropFrame(traceFrameId: Int?, reason: String) -> Bool {
         pipelineLock.lock()
         let drop: Bool
@@ -1019,7 +1022,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         pipelineLock.unlock()
         guard drop else { return false }
-        needsKeyframe = true
         dropsThisWindow += 1
         dropsTotal += 1
         if let traceFrameId {
