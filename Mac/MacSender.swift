@@ -117,11 +117,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
 
-    // Backpressure: outstanding sends. If the socket can't keep up we drop
-    // frames instead of queueing latency, then force a keyframe to resync.
-    // Kept tight: at 60fps each queued send is ~17ms of added latency.
+    // Backpressure: drop frames instead of queueing latency.
+    // - pendingEncodes: VTCompressionSession is async; cap at 1 so we never
+    //   pipeline multiple hardware encodes (parallel encodes spike latency).
+    // - pendingSends: cap at 1 so the socket can't build a multi-frame backlog.
+    private var pendingEncodes = 0
+    private let maxPendingEncodes = 1
     private var pendingSends = 0
-    private let maxPendingSends = 3
+    private let maxPendingSends = 1
+    private let pipelineLock = NSLock()
     private var dropsThisWindow = 0
     private var needsKeyframe = true
     private var connectionReady = false
@@ -457,6 +461,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connection?.cancel()
             self.connection = nil
             self.pendingSends = 0
+            self.pipelineLock.lock()
+            self.pendingEncodes = 0
+            self.pipelineLock.unlock()
             self.connect()
         }
     }
@@ -633,6 +640,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection?.cancel()
         connection = nil
         pendingSends = 0
+        pipelineLock.lock()
+        pendingEncodes = 0
+        pipelineLock.unlock()
         queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this 1s window supersedes this dial instead of
@@ -984,13 +994,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let traceFrameId = MacTrace.frameCaptured { [weak self] json in
             self?.sendJSONFrame(json)
         }
-        if pendingSends > maxPendingSends {
-            needsKeyframe = true   // dropped frames break the P-frame chain
-            dropsThisWindow += 1
-            dropsTotal += 1
-            if let traceFrameId {
-                MacTrace.frameDropped(traceFrameId, reason: "pending_sends")
-            }
+        if shouldDropFrame(traceFrameId: traceFrameId, reason: "pending_encode") {
+            return
+        }
+        if shouldDropFrame(traceFrameId: traceFrameId, reason: "pending_sends") {
             return
         }
 
@@ -998,8 +1005,34 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                  traceFrameId: traceFrameId)
     }
 
+    /// Drop when encode or send pipeline is busy; forces keyframe to resync.
+    private func shouldDropFrame(traceFrameId: Int?, reason: String) -> Bool {
+        pipelineLock.lock()
+        let drop: Bool
+        switch reason {
+        case "pending_encode":
+            drop = pendingEncodes >= maxPendingEncodes
+        case "pending_sends":
+            drop = pendingSends >= maxPendingSends
+        default:
+            drop = false
+        }
+        pipelineLock.unlock()
+        guard drop else { return false }
+        needsKeyframe = true
+        dropsThisWindow += 1
+        dropsTotal += 1
+        if let traceFrameId {
+            MacTrace.frameDropped(traceFrameId, reason: reason)
+        }
+        return true
+    }
+
     private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, traceFrameId: Int? = nil) {
         guard let encoder else { return }
+        pipelineLock.lock()
+        pendingEncodes += 1
+        pipelineLock.unlock()
         if let traceFrameId { MacTrace.encodeSubmitted(traceFrameId) }
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
@@ -1007,7 +1040,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
             needsKeyframe = false
         }
-        VTCompressionSessionEncodeFrame(
+        let submitStatus = VTCompressionSessionEncodeFrame(
             encoder,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: pts,
@@ -1015,7 +1048,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             frameProperties: frameProperties,
             infoFlagsOut: nil
         ) { [weak self] status, _, buffer in
-            guard status == noErr, let buffer, let self else { return }
+            guard let self else { return }
+            defer {
+                self.pipelineLock.lock()
+                self.pendingEncodes = max(0, self.pendingEncodes - 1)
+                self.pipelineLock.unlock()
+            }
+            guard status == noErr, let buffer else { return }
             if let traceFrameId { MacTrace.encodeFinished(traceFrameId) }
             if let data = self.annexB(from: buffer) {
                 let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1032,6 +1071,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 framed.append(data)
                 self.sendFramed(framed, traceFrameId: traceFrameId)
             }
+        }
+        if submitStatus != noErr {
+            pipelineLock.lock()
+            pendingEncodes = max(0, pendingEncodes - 1)
+            pipelineLock.unlock()
+            Log.info("VTCompressionSessionEncodeFrame failed: \(submitStatus)")
         }
     }
 
@@ -1128,7 +1173,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         pendingSends += 1
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            self.pendingSends -= 1
+            self.pipelineLock.lock()
+            self.pendingSends = max(0, self.pendingSends - 1)
+            self.pipelineLock.unlock()
             if let traceFrameId { MacTrace.sendFinished(traceFrameId) }
             if let error {
                 Log.info("send error: \(error)")
