@@ -36,6 +36,15 @@ struct PerfStats: Equatable {
     var inputP50 = 0.0           // touch sent → CGEvent injected on the Mac, ms
     var inputP95 = 0.0
     var capFps = 0               // frames ScreenCaptureKit delivered on the Mac
+    // Pen round-trip: Apple Pencil on glass → frame on the iPad.
+    var strokeP50 = 0.0
+    var strokeP95 = 0.0
+    var strokeSamples: [Double] = []
+    var macPaintP50 = 0.0        // Mac inject → ScreenCaptureKit frame
+    var macPaintP95 = 0.0
+    var strokePhotonP50 = 0.0    // pen → glass (Metal renderer only)
+    var strokePhotonP95 = 0.0
+    var strokePhotonSamples: [Double] = []
     // Metal renderer path only:
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
     var photonP50 = 0.0          // Mac capture → frame actually on glass, ms
@@ -93,6 +102,19 @@ final class PhoneReceiver: ObservableObject {
     private var macInputP50 = 0.0
     private var macInputP95 = 0.0
     private var macCapFps = 0
+    private var macPaintP50 = 0.0
+    private var macPaintP95 = 0.0
+
+    private struct PendingPenSample {
+        let devMs: Double
+        let macMs: Double
+        var matched = false
+    }
+    private var pendingPenSamples: [PendingPenSample] = []
+    private var strokeWindow: [Double] = []
+    private var strokeRing: [Double] = []
+    private var strokePhotonWindow: [Double] = []
+    private var strokePhotonRing: [Double] = []
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -126,6 +148,8 @@ final class PhoneReceiver: ObservableObject {
             if photon > -50, photon < 5000 {
                 self.photonWindow.append(max(photon, 0))
             }
+            self.recordStrokeLatencies(displayDevMs: presentedWallMs,
+                                       captureMs: captureMs, sendMs: nil, photon: true)
         }
     }
 
@@ -333,6 +357,8 @@ final class PhoneReceiver: ObservableObject {
             macPending = obj["pending"] as? Int ?? macPending
             macInputP50 = obj["inp50"] as? Double ?? macInputP50
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
+            macPaintP50 = obj["paint50"] as? Double ?? macPaintP50
+            macPaintP95 = obj["paint95"] as? Double ?? macPaintP95
             macCapFps = obj["capFps"] as? Int ?? macCapFps
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
@@ -396,6 +422,11 @@ final class PhoneReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+        pendingPenSamples.removeAll(keepingCapacity: true)
+        strokeWindow.removeAll(keepingCapacity: true)
+        strokeRing.removeAll(keepingCapacity: true)
+        strokePhotonWindow.removeAll(keepingCapacity: true)
+        strokePhotonRing.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -417,14 +448,25 @@ final class PhoneReceiver: ObservableObject {
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
     /// measure touch→injection latency without doing its own clock sync.
     func sendTouch(phase: String, x: Double, y: Double) {
-        var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
-        stampMacTime(&msg)
-        sendControl(msg)
+        let devMs = nowMs
+        let macMs = clockOffsetMs.map { devMs + $0 }
+        var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y,
+                                  "tDev": devMs]
+        if let macMs { msg["t"] = macMs }
+        queue.async {
+            if phase == "began" || phase == "moved", let macMs {
+                self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
+                if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
+            }
+            self.sendControl(msg)
+        }
     }
 
     func sendPencil(phase: PencilPhase, x: Double, y: Double,
                     pressure: Double, azimuth: Double, altitude: Double,
                     rotation: Double) {
+        let devMs = nowMs
+        let macMs = clockOffsetMs.map { devMs + $0 }
         var msg: [String: Any] = [
             "type": WireInput.pencil,
             "phase": phase.rawValue,
@@ -433,9 +475,16 @@ final class PhoneReceiver: ObservableObject {
             "azimuth": azimuth,
             "altitude": altitude,
             "rotation": rotation,
+            "tDev": devMs,
         ]
-        stampMacTime(&msg)
-        sendControl(msg)
+        if let macMs { msg["t"] = macMs }
+        queue.async {
+            if phase != .hover, let macMs {
+                self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
+                if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
+            }
+            self.sendControl(msg)
+        }
     }
 
     func sendProximity(entering: Bool, eraser: Bool) {
@@ -467,8 +516,38 @@ final class PhoneReceiver: ObservableObject {
         sendControl(["type": "scroll", "dx": dx, "dy": dy])
     }
 
-    private func stampMacTime(_ msg: inout [String: Any]) {
-        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
+    /// Match each pen sample to the first frame captured on the Mac after it.
+    private func recordStrokeLatencies(displayDevMs: Double, captureMs: Double,
+                                       sendMs: Double?, photon: Bool) {
+        guard clockOffsetMs != nil else { return }
+        for i in pendingPenSamples.indices {
+            guard !pendingPenSamples[i].matched else { continue }
+            guard captureMs >= pendingPenSamples[i].macMs else { continue }
+            let lat = displayDevMs - pendingPenSamples[i].devMs
+            if lat > 0, lat < 500 {
+                if photon {
+                    strokePhotonWindow.append(lat)
+                    strokePhotonRing.append(lat)
+                    if strokePhotonRing.count > maxSamples { strokePhotonRing.removeFirst() }
+                } else {
+                    strokeWindow.append(lat)
+                    strokeRing.append(lat)
+                    if strokeRing.count > maxSamples { strokeRing.removeFirst() }
+                }
+                if LatencyTelemetry.detailedLogEnabled {
+                    var line = "\(LatencyTelemetry.logPrefix) stroke ms=\(String(format: "%.1f", lat))"
+                    line += " pen=\(Int(pendingPenSamples[i].devMs)) cap=\(Int(captureMs))"
+                    line += " disp=\(Int(displayDevMs)) photon=\(photon)"
+                    if let sendMs, let offset = clockOffsetMs {
+                        let sendDevMs = sendMs - offset
+                        line += " net=\(String(format: "%.1f", displayDevMs - sendDevMs))"
+                    }
+                    Log.info(line)
+                }
+            }
+            pendingPenSamples[i].matched = true
+        }
+        pendingPenSamples.removeAll { $0.matched && displayDevMs - $0.devMs > 500 }
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {
@@ -712,6 +791,8 @@ final class PhoneReceiver: ObservableObject {
                     if e2eRing.count > maxSamples { e2eRing.removeFirst() }
                 }
             }
+            recordStrokeLatencies(displayDevMs: nowMs, captureMs: captureMs,
+                                  sendMs: sendMs, photon: false)
         }
 
         framesThisWindow += 1
@@ -739,6 +820,14 @@ final class PhoneReceiver: ObservableObject {
             stats.inputP50 = macInputP50
             stats.inputP95 = macInputP95
             stats.capFps = macCapFps
+            stats.strokeP50 = percentile(strokeWindow, 0.5)
+            stats.strokeP95 = percentile(strokeWindow, 0.95)
+            stats.strokeSamples = strokeRing
+            stats.macPaintP50 = macPaintP50
+            stats.macPaintP95 = macPaintP95
+            stats.strokePhotonP50 = percentile(strokePhotonWindow, 0.5)
+            stats.strokePhotonP95 = percentile(strokePhotonWindow, 0.95)
+            stats.strokePhotonSamples = strokePhotonRing
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)
             stats.photonP95 = percentile(photonWindow, 0.95)
@@ -763,6 +852,11 @@ final class PhoneReceiver: ObservableObject {
                     "rtt": lastRttMs.rounded(),
                     "stalls": stats.stalls,
                     "inp50": macInputP50.rounded(),
+                    "paint50": macPaintP50.rounded(),
+                    "paint95": macPaintP95.rounded(),
+                    "str50": stats.strokeP50.rounded(),
+                    "str95": stats.strokeP95.rounded(),
+                    "strPh50": stats.strokePhotonP50.rounded(),
                     "capFps": macCapFps,
                     "dec50": stats.decodeP50.rounded(),
                     "ph50": stats.photonP50.rounded(),
@@ -773,6 +867,8 @@ final class PhoneReceiver: ObservableObject {
                 encodeWindow.removeAll(keepingCapacity: true)
                 decodeWindow.removeAll(keepingCapacity: true)
                 photonWindow.removeAll(keepingCapacity: true)
+                strokeWindow.removeAll(keepingCapacity: true)
+                strokePhotonWindow.removeAll(keepingCapacity: true)
             }
 
             DispatchQueue.main.async {

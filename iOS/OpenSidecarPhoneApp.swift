@@ -315,9 +315,17 @@ struct PerfOverlay: View {
                     metric("photon", String(format: "%.0f ms", stats.photonP50))
                 }
                 if stats.inputP50 > 0 {
-                    // touch→CGEvent on the Mac; full touch-to-photon adds
-                    // the render+capture wait and one e2e on top.
                     metric("input", String(format: "%.0f ms", stats.inputP50))
+                }
+                if stats.macPaintP50 > 0 {
+                    metric("paint", String(format: "%.0f ms", stats.macPaintP50))
+                }
+                if stats.strokeP50 > 0 {
+                    metric("stroke", String(format: "%.0f ms", stats.strokeP50))
+                    metric("str p95", String(format: "%.0f ms", stats.strokeP95))
+                }
+                if stats.strokePhotonP50 > 0 {
+                    metric("stroke∅", String(format: "%.0f ms", stats.strokePhotonP50))
                 }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
                 metric("FPS", "\(stats.fps)")
@@ -350,12 +358,18 @@ struct PerfOverlay: View {
 
     @ViewBuilder
     private var graphs: some View {
-        graph("latency ms (cap→display)",
+        graph("cap→display ms",
               BarGraph(samples: stats.e2eSamples, ceiling: 80,
                        good: 25, warn: 40, reference: nil))
-        graph("frame interval ms",
-              BarGraph(samples: stats.samples, ceiling: 60,
-                       good: 25, warn: 50, reference: 16.7))
+        if !stats.strokeSamples.isEmpty {
+            graph("pen→display ms",
+                  BarGraph(samples: stats.strokeSamples, ceiling: 120,
+                           good: 16, warn: 32, reference: 16.7))
+        } else {
+            graph("frame interval ms",
+                  BarGraph(samples: stats.samples, ceiling: 60,
+                           good: 25, warn: 50, reference: 16.7))
+        }
     }
 
     private func metric(_ label: String, _ value: String) -> some View {
@@ -463,6 +477,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage(LatencyTelemetry.detailedLogKey) private var latencyLog = false
 
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -497,10 +512,11 @@ struct SettingsView: View {
                 Section {
                     Toggle("Performance overlay", isOn: $showAnalytics)
                     Toggle("Metal renderer (experimental)", isOn: $metalRenderer)
+                    Toggle("Latency detail log", isOn: $latencyLog)
                 } header: {
                     Text("Analytics")
                 } footer: {
-                    Text("The overlay shows FPS, bitrate, frame timing, stalls, and latency graphs at the bottom of the screen while streaming. The experimental Metal renderer decodes and presents frames manually — it adds decode and true on-glass latency metrics to the overlay, but in our measurements the system video layer displays frames faster. Leave it off unless you're debugging.")
+                    Text("Overlay: FPS, bitrate, latency breakdown. stroke = pen on glass → iPad display (target under 16 ms). input = pen → Mac; paint = inject → capture; latency = capture → display. Detail log writes [latency] lines to the device log.")
                 }
 
                 Section {

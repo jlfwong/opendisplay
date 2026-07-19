@@ -6,6 +6,9 @@ import AppKit
 /// point mouse subtypes; fingers use left-button mouse events.
 final class InputInjector {
 
+    /// Wall-clock ms when the last touch/pencil event was injected (Mac clock).
+    private(set) var lastInjectMs: Double = 0
+
     private let displayID: CGDirectDisplayID
     private let source: CGEventSource
     private var inRange = false
@@ -143,6 +146,7 @@ final class InputInjector {
                             tiltX: tiltX, tiltY: tiltY, rotation: rotation)
         }
 
+        markInjected()
         lastPenEvent = Date()
         if penDown && idleTimer == nil { startIdleTimer() }
     }
@@ -177,6 +181,7 @@ final class InputInjector {
             return
         }
         postMouse(type: type, at: p, button: .left)
+        markInjected()
     }
 
     // MARK: - Gestures
@@ -340,6 +345,10 @@ final class InputInjector {
         up.flags = CGEventFlags(rawValue: UInt64(flags.rawValue))
         logPost("keyUp vk=\(keyCode)", flags: up.flags)
         up.post(tap: .cghidEventTap)
+    }
+
+    private func markInjected() {
+        lastInjectMs = Date().timeIntervalSince1970 * 1000
     }
 
     // MARK: - Coordinate mapping

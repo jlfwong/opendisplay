@@ -164,6 +164,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Input latency: touches arrive stamped in our clock (the phone applies
     // its sync offset); delta to now = network + deframe + dispatch.
     private var inputLatencies: [Double] = []
+    /// Inject → next ScreenCaptureKit frame (Mac app render + compositor).
+    private var paintWaitWindow: [Double] = []
+    private var lastLatencyEncLog = Date.distantPast
     // Capture cadence: SCK only emits on content change, so the phone can't
     // tell "Mac rendered 45fps" from "frames got lost" — count deliveries here.
     private var capFrames = 0
@@ -655,7 +658,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                let paintSorted = self.paintWaitWindow.sorted()
+                let paint50 = paintSorted.isEmpty ? 0 : paintSorted[paintSorted.count / 2].rounded()
+                let paint95 = paintSorted.isEmpty ? 0 : paintSorted[min(paintSorted.count - 1, Int(Double(paintSorted.count) * 0.95))].rounded()
+                self.paintWaitWindow.removeAll(keepingCapacity: true)
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"paint50\":\(paint50),\"paint95\":\(paint95),\"capFps\":\(capFps)}")
             }
             self.schedulePing()
         }
@@ -845,6 +852,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if delta > -50, delta < 1000 {
                     inputLatencies.append(max(delta, 0))
                     if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
+                    if LatencyTelemetry.detailedLogEnabled,
+                       type == WireInput.pencil,
+                       let phase = obj["phase"] as? String,
+                       phase != "hover" {
+                        Log.info("\(LatencyTelemetry.logPrefix) inject \(type) \(phase) wireMs=\(String(format: "%.1f", delta)) pending=\(pendingSends)")
+                    }
                 }
             }
         case "kf":
@@ -937,6 +950,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastPixelBuffer = pixelBuffer
         lastCaptureAt = Date()
         capFrames += 1
+        let capturedAtMs = Date().timeIntervalSince1970 * 1000
+        if let inj = inputInjector?.lastInjectMs {
+            let wait = capturedAtMs - inj
+            if wait >= 0, wait < 200 {
+                paintWaitWindow.append(wait)
+                if paintWaitWindow.count > 240 { paintWaitWindow.removeFirst(120) }
+            }
+        }
 
         // No receiver, or the socket is backed up: skip this frame entirely.
         guard connectionReady else { return }
@@ -972,6 +993,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // parses it and skips to the H.264 payload. cap = capture time,
                 // snd = handoff to the socket (so cap→snd ≈ encode duration).
                 let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
+                let encMs = sndMs - capturedAtMs
+                if LatencyTelemetry.detailedLogEnabled,
+                   Date().timeIntervalSince(self.lastLatencyEncLog) > 0.25 {
+                    self.lastLatencyEncLog = Date()
+                    Log.info("\(LatencyTelemetry.logPrefix) enc cap=\(capturedAtMs) snd=\(sndMs) encMs=\(encMs) pending=\(self.pendingSends)")
+                }
                 var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs)}".utf8)
                 framed.append(data)
                 self.sendFramed(framed)
