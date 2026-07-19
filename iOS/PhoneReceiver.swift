@@ -480,7 +480,8 @@ final class PhoneReceiver: ObservableObject {
         let devMs = nowMs
         let macMs = clockOffsetMs.map { devMs + $0 }
         var inpId: Int?
-        if TraceCollector.shared.isActive, phase != .hover {
+        // Trace input rows on down/up only — move floods memory and control messages.
+        if TraceCollector.shared.isActive, phase == .down || phase == .up {
             let id = IPadTrace.nextInputId()
             inpId = id
             IPadTrace.noteInputEmit(inputId: id, devWallMs: devMs)
@@ -573,14 +574,16 @@ final class PhoneReceiver: ObservableObject {
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {
-        guard let conn = conn ?? connection,
-              let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
-        var header = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &header, count: 4)
-        frame.append(payload)
-        conn.send(content: frame, completion: .contentProcessed { error in
-            if let error { Log.info("control send error: \(error)") }
-        })
+        queue.async {
+            guard let conn = conn ?? self.connection,
+                  let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
+            var header = UInt32(payload.count).bigEndian
+            var frame = Data(bytes: &header, count: 4)
+            frame.append(payload)
+            conn.send(content: frame, completion: .contentProcessed { error in
+                if let error { Log.info("control send error: \(error)") }
+            })
+        }
     }
 
     // MARK: - Socket read + length-prefixed deframing

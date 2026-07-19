@@ -114,7 +114,17 @@ enum IPadTrace {
         awaitingUpload = false
         TraceCollector.shared.stop(reason: "uploading spans")
         let spans = TraceCollector.shared.ipadSnapshot()
-        guard var msg = TraceWire.uploadMessage(sessionId: sessionId, spans: spans) else { return }
+        guard var msg = TraceWire.uploadMessage(sessionId: sessionId, spans: spans) else {
+            Log.info("[trace] upload encode failed (\(spans.count) spans)")
+            pendingSessionId = nil
+            return
+        }
+        if let payload = try? JSONSerialization.data(withJSONObject: msg),
+           payload.count > 900_000 {
+            Log.info("[trace] upload too large (\(payload.count) bytes) — skipping wire upload")
+            pendingSessionId = nil
+            return
+        }
         msg["displayedFrames"] = displayedFrameIds.count
         send(msg)
         Log.info("[trace] uploaded \(spans.count) iPad spans (\(displayedFrameIds.count) frames)")

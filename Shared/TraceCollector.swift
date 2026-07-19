@@ -17,6 +17,7 @@ final class TraceCollector {
     private var ipadSpans: [TraceSpan] = []
     private var notes: [String] = []
     private var clockOffsetMs: Double = 0
+    private let maxSpans = 8_000
 
     /// Per-frame open interval start markers (Mac clock ms).
     private var frameMarks: [Int: [String: Double]] = [:]
@@ -125,6 +126,7 @@ final class TraceCollector {
         lock.lock()
         defer { lock.unlock() }
         guard active else { return }
+        guard macSpans.count + ipadSpans.count < maxSpans else { return }
         let s = TraceSpan(rowKind: rowKind, rowId: rowId, phase: phase,
                           startMs: startMs, endMs: endMs, meta: meta)
         switch side {
