@@ -40,12 +40,23 @@ struct TraceSession: Codable, Equatable {
     var allSpans: [TraceSpan] { macSpans + ipadSpans }
 }
 
+enum TraceMode: String, Codable {
+    case frame
+    case input
+}
+
 /// Canonical phase names — keep stable for Perfetto slice filters.
 enum TracePhase {
-    // Input row (iPad → Mac)
-    static let inputEmit = "input.emit"           // iPad: touch/pencil captured
-    static let inputWire = "input.wire"           // iPad send → Mac recv complete
-    static let inputInject = "input.inject"     // Mac: CGEvent posted
+    // Input row: iPad OS delivery → Mac compositor paint (one row per event)
+    static let inputOs = "input.os"               // UIKit delivery → InputCapture emit
+    static let inputQueue = "input.queue"         // emit → receiver queue runs
+    static let inputSend = "input.send"           // queue → TCP send ack
+    static let inputWire = "input.wire"           // Mac recv (wire t → recv handler)
+    static let inputDispatch = "input.dispatch"   // recv → inject start
+    static let inputInject = "input.inject"       // CGEvent post
+    static let inputPaint = "input.paint"         // inject → SCK captures change
+    // Legacy aliases (older traces)
+    static let inputEmit = "input.emit"
 
     // Frame row (Mac capture → iPad display)
     static let frameSck = "frame.sck"           // SCK delivered pixel buffer
@@ -99,9 +110,14 @@ enum TraceExporter {
         TracePhase.frameDisplay: 60,
         TracePhase.framePresent: 70,
         TracePhase.frameDropped: 90,
+        TracePhase.inputOs: 0,
         TracePhase.inputEmit: 0,
-        TracePhase.inputWire: 10,
-        TracePhase.inputInject: 20,
+        TracePhase.inputQueue: 10,
+        TracePhase.inputSend: 20,
+        TracePhase.inputWire: 30,
+        TracePhase.inputDispatch: 40,
+        TracePhase.inputInject: 50,
+        TracePhase.inputPaint: 60,
     ]
 
     /// Convert a merged session to Chrome Trace JSON for ui.perfetto.dev.
@@ -186,11 +202,15 @@ enum TraceExporter {
     private static func side(for phase: String) -> String {
         switch phase {
         case TracePhase.frameSck, TracePhase.frameEncodeWait, TracePhase.frameEncode,
-             TracePhase.frameTcpSend, TracePhase.frameDropped, TracePhase.inputInject:
+             TracePhase.frameTcpSend, TracePhase.frameDropped,
+             TracePhase.inputDispatch, TracePhase.inputInject, TracePhase.inputPaint:
             return "mac"
         case TracePhase.frameTcpTransit, TracePhase.frameRecv, TracePhase.frameDisplay,
-             TracePhase.framePresent, TracePhase.inputEmit:
+             TracePhase.framePresent,
+             TracePhase.inputOs, TracePhase.inputEmit, TracePhase.inputQueue, TracePhase.inputSend:
             return "ipad"
+        case TracePhase.inputWire:
+            return "wire"
         default:
             return "wire"
         }

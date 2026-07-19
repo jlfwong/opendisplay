@@ -648,13 +648,14 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
-        view.inputEngine.onTouch = { [weak receiver] phase, x, y in
-            receiver?.sendTouch(phase: phase, x: x, y: y)
+        view.inputEngine.onTouch = { [weak receiver] phase, x, y, osMs, captureMs in
+            receiver?.sendTouch(phase: phase, x: x, y: y, osMs: osMs, captureMs: captureMs)
         }
-        view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation in
+        view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation, osMs, captureMs in
             receiver?.sendPencil(phase: phase, x: x, y: y,
                                  pressure: pressure, azimuth: azimuth,
-                                 altitude: altitude, rotation: rotation)
+                                 altitude: altitude, rotation: rotation,
+                                 osMs: osMs, captureMs: captureMs)
         }
         view.inputEngine.onProximity = { [weak receiver] entering, eraser in
             receiver?.sendProximity(entering: entering, eraser: eraser)
@@ -784,16 +785,20 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-            inputEngine.handle(touches, event: event, phase: "began", ended: false)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "began", ended: false, osDeliveredMs: osMs)
         }
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-            inputEngine.handle(touches, event: event, phase: "moved", ended: false)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "moved", ended: false, osDeliveredMs: osMs)
         }
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-            inputEngine.handle(touches, event: event, phase: "ended", ended: true)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "ended", ended: true, osDeliveredMs: osMs)
         }
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-            inputEngine.handle(touches, event: event, phase: "cancelled", ended: true)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "cancelled", ended: true, osDeliveredMs: osMs)
         }
     }
 }

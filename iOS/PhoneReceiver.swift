@@ -466,40 +466,52 @@ final class PhoneReceiver: ObservableObject {
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
     /// measure touch→injection latency without doing its own clock sync.
-    func sendTouch(phase: String, x: Double, y: Double) {
+    func sendTouch(phase: String, x: Double, y: Double,
+                    osMs: Double, captureMs: Double) {
         let devMs = nowMs
         let macMs = clockOffsetMs.map { devMs + $0 }
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y,
                                   "tDev": devMs]
         if let macMs { msg["t"] = macMs }
         queue.async {
+            let queueMs = self.nowMs
+            var inpId: Int?
+            var traceThis = false
+            if self.shouldTraceInput(phase: phase) {
+                inpId = IPadTrace.nextInputId()
+                traceThis = true
+                msg["inpId"] = inpId
+            }
             if phase == "began" || phase == "moved", let macMs {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
             }
-            self.sendControl(msg)
+            self.sendControl(msg) {
+                guard traceThis, let inpId else { return }
+                IPadTrace.recordInput(inputId: inpId, phase: phase,
+                                      osMs: osMs, captureMs: captureMs,
+                                      queueMs: queueMs, sendMs: self.nowMs)
+            }
         }
     }
 
     func sendPencil(phase: PencilPhase, x: Double, y: Double,
                     pressure: Double, azimuth: Double, altitude: Double,
-                    rotation: Double) {
-        // Pencil callbacks arrive on the main thread; trace + NWConnection must
-        // stay on the receiver queue to avoid Dictionary races with frame recv.
+                    rotation: Double, osMs: Double, captureMs: Double) {
         queue.async {
             if phase == .down {
                 IPadTrace.beginOnPenDown(clockOffsetMs: self.clockOffsetMs) { msg in
                     self.sendControl(msg)
                 }
             }
+            let queueMs = self.nowMs
             let devMs = self.nowMs
             let macMs = self.clockOffsetMs.map { devMs + $0 }
             var inpId: Int?
-            // Trace input rows on down/up only — move floods memory and control messages.
-            if TraceCollector.shared.isActive, phase == .down || phase == .up {
-                let id = IPadTrace.nextInputId()
-                inpId = id
-                IPadTrace.noteInputEmit(inputId: id, devWallMs: devMs)
+            var traceThis = false
+            if self.shouldTraceInput(phase: phase.rawValue) {
+                inpId = IPadTrace.nextInputId()
+                traceThis = true
             }
             var msg: [String: Any] = [
                 "type": WireInput.pencil,
@@ -517,15 +529,22 @@ final class PhoneReceiver: ObservableObject {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
             }
-            if let inpId {
-                IPadTrace.noteInputSent(inputId: inpId, devWallMs: devMs, wireMacMs: macMs)
+            self.sendControl(msg) {
+                guard traceThis, let inpId else { return }
+                IPadTrace.recordInput(inputId: inpId, phase: phase.rawValue,
+                                      osMs: osMs, captureMs: captureMs,
+                                      queueMs: queueMs, sendMs: self.nowMs)
             }
-            self.sendControl(msg)
-            // Finish on pen-up — don't wait for 100 Mac SCK frames (~9s at 11fps).
             if phase == .up {
                 IPadTrace.finishUpload { msg in self.sendControl(msg) }
             }
         }
+    }
+
+    private func shouldTraceInput(phase: String) -> Bool {
+        guard TraceCollector.shared.tracesInput else { return false }
+        if phase == "hover" { return false }
+        return TraceCollector.shared.consumeInputBudget()
     }
 
     func sendProximity(entering: Bool, eraser: Bool) {
@@ -591,7 +610,8 @@ final class PhoneReceiver: ObservableObject {
         pendingPenSamples.removeAll { $0.matched && displayDevMs - $0.devMs > 500 }
     }
 
-    private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {
+    private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
+                               sent: (() -> Void)? = nil) {
         let send = { [weak self] in
             guard let self else { return }
             guard let conn = conn ?? self.connection,
@@ -601,6 +621,7 @@ final class PhoneReceiver: ObservableObject {
             frame.append(payload)
             conn.send(content: frame, completion: .contentProcessed { error in
                 if let error { Log.info("control send error: \(error)") }
+                sent?()
             })
         }
         if DispatchQueue.getSpecific(key: Self.queueKey) != nil {

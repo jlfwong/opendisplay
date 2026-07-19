@@ -878,10 +878,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case WireTrace.traceStart:
-            if let sessionId = obj["sessionId"] as? String,
-               let maxFrames = obj["maxFrames"] as? Int {
+            if let sessionId = obj["sessionId"] as? String {
+                let modeStr = obj["mode"] as? String ?? TraceMode.frame.rawValue
+                let mode = TraceMode(rawValue: modeStr) ?? .frame
+                let maxFrames = obj["maxFrames"] as? Int ?? 100
+                let maxInputs = obj["maxInputs"] as? Int ?? 0
                 let offset = obj["clockOffset"] as? Double ?? 0
-                MacTrace.handleTraceStart(sessionId: sessionId, maxFrames: maxFrames,
+                MacTrace.handleTraceStart(sessionId: sessionId, mode: mode,
+                                          maxFrames: maxFrames, maxInputs: maxInputs,
                                           clockOffsetMs: offset)
             }
         case WireTrace.traceUpload:
@@ -893,13 +897,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             logInputWire(obj)
             let inpId = obj["inpId"] as? Int
             let wireMacMs = obj["t"] as? Double
+            let pencilPhase = obj["phase"] as? String
+            let recvMs = Date().timeIntervalSince1970 * 1000
             if let inpId, let wireMacMs {
-                MacTrace.inputReceived(inputId: inpId, wireStartMs: wireMacMs)
+                MacTrace.inputWire(inputId: inpId, wireStartMs: wireMacMs, recvMs: recvMs)
             }
             let injectStart = Date().timeIntervalSince1970 * 1000
             inputInjector?.handleControl(obj)
+            let injectEnd = Date().timeIntervalSince1970 * 1000
             if let inpId {
-                MacTrace.inputInjected(inputId: inpId, injectStartMs: injectStart)
+                MacTrace.inputDispatch(inputId: inpId, recvMs: recvMs, injectStartMs: injectStart)
+                MacTrace.inputInject(inputId: inpId, injectStartMs: injectStart,
+                                     injectEndMs: injectEnd, phase: pencilPhase)
             }
             if let t = obj["t"] as? Double {
                 let delta = Date().timeIntervalSince1970 * 1000 - t
@@ -1012,6 +1021,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if paintWaitWindow.count > 240 { paintWaitWindow.removeFirst(120) }
             }
         }
+        MacTrace.tryCompletePaint(captureMs: capturedAtMs)
 
         // No receiver, or the socket is backed up: skip this frame entirely.
         guard connectionReady else { return }

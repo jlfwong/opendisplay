@@ -7,10 +7,11 @@ import UIKit
 /// Captures pencil, hover, and gesture input. Coordinates are normalized
 /// [0,1] in video space (origin top-left) via the host view's normalize closure.
 final class InputCaptureEngine: NSObject {
-    var onTouch: ((_ phase: String, _ x: Double, _ y: Double) -> Void)?
+    var onTouch: ((_ phase: String, _ x: Double, _ y: Double,
+                     _ osMs: Double, _ captureMs: Double) -> Void)?
     var onPencil: ((_ phase: PencilPhase, _ x: Double, _ y: Double,
                     _ pressure: Double, _ azimuth: Double, _ altitude: Double,
-                    _ rotation: Double) -> Void)?
+                    _ rotation: Double, _ osMs: Double, _ captureMs: Double) -> Void)?
     var onProximity: ((_ entering: Bool, _ eraser: Bool) -> Void)?
     var onGesture: ((_ kind: GestureKind, _ state: GestureState,
                      _ scale: Double?, _ velocity: Double?,
@@ -74,11 +75,24 @@ final class InputCaptureEngine: NSObject {
         return norm(sum).map { ($0.0, $0.1) }
     }
 
+    private func emitTouch(phase: String, x: Double, y: Double, osDeliveredMs: Double) {
+        let captureMs = Date().timeIntervalSince1970 * 1000
+        onTouch?(phase, x, y, osDeliveredMs, captureMs)
+    }
+
+    private func emitPencil(_ phase: PencilPhase, x: Double, y: Double,
+                            pressure: Double, azimuth: Double, altitude: Double,
+                            rotation: Double, osDeliveredMs: Double) {
+        let captureMs = Date().timeIntervalSince1970 * 1000
+        onPencil?(phase, x, y, pressure, azimuth, altitude, rotation, osDeliveredMs, captureMs)
+    }
+
     // MARK: - Hover (pen in air)
 
     @objc private func hoverChanged(_ gr: UIHoverGestureRecognizer) {
         guard activePens.isEmpty, let view = hostView else { return }
         guard let (nx, ny) = norm(gr.location(in: view)) else { return }
+        let osMs = Date().timeIntervalSince1970 * 1000
         switch gr.state {
         case .began, .changed:
             if !hoverInRange {
@@ -86,7 +100,7 @@ final class InputCaptureEngine: NSObject {
                 hoverInRange = true
                 logCapture("hover enter")
             }
-            onPencil?(.hover, nx, ny, 0, 0, .pi / 2, 0)
+            emitPencil(.hover, x: nx, y: ny, pressure: 0, azimuth: 0, altitude: .pi / 2, rotation: 0, osDeliveredMs: osMs)
         case .ended, .cancelled, .failed:
             if hoverInRange {
                 onProximity?(false, false)
@@ -117,13 +131,14 @@ final class InputCaptureEngine: NSObject {
         }
     }
 
-    func handle(_ touches: Set<UITouch>, event: UIEvent?, phase: String, ended: Bool) {
+    func handle(_ touches: Set<UITouch>, event: UIEvent?, phase: String, ended: Bool,
+                osDeliveredMs: Double) {
         trackFingerTouches(touches, ended: ended)
         let blockFinger = activeFingerTouches.count > 1
         if blockFinger {
             if !sentCancelForBlock, let last = lastFingerNorm {
                 logCapture("block finger phase=\(phase) activeFingers=\(activeFingerTouches.count) — cancel once")
-                onTouch?("cancelled", last.x, last.y)
+                emitTouch(phase: "cancelled", x: last.x, y: last.y, osDeliveredMs: osDeliveredMs)
                 sentCancelForBlock = true
             }
         } else {
@@ -133,16 +148,16 @@ final class InputCaptureEngine: NSObject {
         for touch in touches {
             switch touch.type {
             case .pencil, .stylus:
-                emitPen(touch, event: event, ended: ended)
+                emitPen(touch, event: event, ended: ended, osDeliveredMs: osDeliveredMs)
             default:
                 guard isFinger(touch) else { continue }
                 guard !blockFinger, activeFingerTouches.count <= 1 else { continue }
-                emitFinger(touch, event: event, phase: phase)
+                emitFinger(touch, event: event, phase: phase, osDeliveredMs: osDeliveredMs)
             }
         }
     }
 
-    private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool) {
+    private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool, osDeliveredMs: Double) {
         guard let view = hostView else { return }
         let id = UInt64(bitPattern: Int64(ObjectIdentifier(touch).hashValue))
         let loc = touch.location(in: view)
@@ -181,17 +196,17 @@ final class InputCaptureEngine: NSObject {
                 penStrokes[id] = stroke
                 if let (sx, sy) = norm(stroke.start) {
                     logCapture("pen stroke down @ \(fmt(sx, sy))")
-                    onPencil?(.down, sx, sy, pressure, azimuth, altitude, rotationDeg)
+                    emitPencil(.down, x: sx, y: sy, pressure: pressure, azimuth: azimuth, altitude: altitude, rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
                 }
             }
-            onPencil?(.move, nx, ny, pressure, azimuth, altitude, rotationDeg)
+            emitPencil(.move, x: nx, y: ny, pressure: pressure, azimuth: azimuth, altitude: altitude, rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
             for c in event?.coalescedTouches(for: touch) ?? [] where c !== touch {
                 guard let (cx, cy) = norm(c.location(in: view)) else { continue }
-                onPencil?(.move, cx, cy,
-                           min(Double(c.force), 1.0),
-                           Double(c.azimuthAngle(in: view)),
-                           Double(c.altitudeAngle),
-                           rotationDeg)
+                emitPencil(.move, x: cx, y: cy,
+                           pressure: min(Double(c.force), 1.0),
+                           azimuth: Double(c.azimuthAngle(in: view)),
+                           altitude: Double(c.altitudeAngle),
+                           rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
             }
             return
         }
@@ -204,26 +219,27 @@ final class InputCaptureEngine: NSObject {
 
         if let stroke = penStrokes[id], !stroke.sentDown {
             logCapture("pen tap → down+up @ \(fmt(nx, ny))")
-            onPencil?(.down, nx, ny, pressure, azimuth, altitude, rotationDeg)
-            onPencil?(.up, nx, ny, 0, azimuth, altitude, rotationDeg)
+            emitPencil(.down, x: nx, y: ny, pressure: pressure, azimuth: azimuth, altitude: altitude, rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
+            emitPencil(.up, x: nx, y: ny, pressure: 0, azimuth: azimuth, altitude: altitude, rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
             return
         }
 
         logCapture("pen up @ \(fmt(nx, ny))")
-        onPencil?(.up, nx, ny, 0, azimuth, altitude, rotationDeg)
+        emitPencil(.up, x: nx, y: ny, pressure: 0, azimuth: azimuth, altitude: altitude, rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
     }
 
-    private func emitFinger(_ touch: UITouch, event: UIEvent?, phase: String) {
+    private func emitFinger(_ touch: UITouch, event: UIEvent?, phase: String,
+                            osDeliveredMs: Double) {
         guard let view = hostView else { return }
         if phase == "moved", let event {
             for t in event.coalescedTouches(for: touch) ?? [touch] {
                 guard let n = norm(t.location(in: view)) else { continue }
                 lastFingerNorm = (x: n.0, y: n.1)
-                onTouch?("moved", n.0, n.1)
+                emitTouch(phase: "moved", x: n.0, y: n.1, osDeliveredMs: osDeliveredMs)
             }
             if let predicted = event.predictedTouches(for: touch)?.last,
                let n = norm(predicted.location(in: view)) {
-                onTouch?("moved", n.0, n.1)
+                emitTouch(phase: "moved", x: n.0, y: n.1, osDeliveredMs: osDeliveredMs)
             }
             return
         }
@@ -233,7 +249,7 @@ final class InputCaptureEngine: NSObject {
         }
         lastFingerNorm = (x: n.0, y: n.1)
         if phase != "moved" { logCapture("finger \(phase) @ \(fmt(n.0, n.1))") }
-        onTouch?(phase, n.0, n.1)
+        emitTouch(phase: phase, x: n.0, y: n.1, osDeliveredMs: osDeliveredMs)
     }
 
     @objc private func twoFingerTapped(_ gr: UITapGestureRecognizer) {

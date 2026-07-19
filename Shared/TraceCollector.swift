@@ -12,6 +12,9 @@ final class TraceCollector {
     private var startedAtMs: Double = 0
     private var maxFrames = 100
     private var frameBudget = 100
+    private var mode: TraceMode = .frame
+    private var maxInputs = 0
+    private var inputBudget = 0
     private var nextInputId = 1
     private var macSpans: [TraceSpan] = []
     private var ipadSpans: [TraceSpan] = []
@@ -29,7 +32,9 @@ final class TraceCollector {
 
     struct SessionConfig {
         let sessionId: String
+        let mode: TraceMode
         let maxFrames: Int
+        let maxInputs: Int
         let clockOffsetMs: Double
         let startedAtMs: Double
     }
@@ -41,8 +46,11 @@ final class TraceCollector {
         guard !active else { return false }
         active = true
         sessionId = config.sessionId
+        mode = config.mode
         maxFrames = config.maxFrames
         frameBudget = config.maxFrames
+        maxInputs = config.maxInputs
+        inputBudget = config.maxInputs
         clockOffsetMs = config.clockOffsetMs
         startedAtMs = config.startedAtMs
         nextInputId = 1
@@ -51,7 +59,7 @@ final class TraceCollector {
         notes.removeAll(keepingCapacity: true)
         frameMarks.removeAll(keepingCapacity: true)
         inputMarks.removeAll(keepingCapacity: true)
-        notes.append("session started maxFrames=\(maxFrames)")
+        notes.append("session started mode=\(mode.rawValue) maxFrames=\(maxFrames) maxInputs=\(maxInputs)")
         return true
     }
 
@@ -75,6 +83,36 @@ final class TraceCollector {
         return active
     }
 
+    var tracesFrames: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active && mode == .frame && frameBudget > 0
+    }
+
+    var tracesInput: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active && mode == .input && inputBudget > 0
+    }
+
+    var traceMode: TraceMode {
+        lock.lock()
+        defer { lock.unlock() }
+        return mode
+    }
+
+    @discardableResult
+    func consumeInputBudget() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard active, mode == .input, inputBudget > 0 else { return false }
+        inputBudget -= 1
+        if inputBudget == 0 {
+            notes.append("input budget exhausted")
+        }
+        return true
+    }
+
     var remainingFrameBudget: Int {
         lock.lock()
         defer { lock.unlock() }
@@ -86,7 +124,7 @@ final class TraceCollector {
     func consumeFrameBudget() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard active, frameBudget > 0 else { return false }
+        guard active, mode == .frame, frameBudget > 0 else { return false }
         frameBudget -= 1
         if frameBudget == 0 {
             notes.append("frame budget exhausted")
@@ -218,11 +256,14 @@ final class TraceCollector {
 
 enum TraceWire {
 
-    static func startMessage(sessionId: String, maxFrames: Int) -> [String: Any] {
+    static func startMessage(sessionId: String, mode: TraceMode,
+                             maxFrames: Int, maxInputs: Int) -> [String: Any] {
         [
             "type": WireTrace.traceStart,
             "sessionId": sessionId,
+            "mode": mode.rawValue,
             "maxFrames": maxFrames,
+            "maxInputs": maxInputs,
             "tDev": Date().timeIntervalSince1970 * 1000,
         ]
     }
