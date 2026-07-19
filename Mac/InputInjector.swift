@@ -20,10 +20,6 @@ final class InputInjector {
     private let vendorID: Int64 = 0x056A
     private let capabilityMask: Int64 = 0x00FE
 
-    private var lastPenEvent = Date.distantPast
-    private let idleTimeoutSeconds: TimeInterval = 0.15
-    private var idleTimer: DispatchSourceTimer?
-
     init(displayID: CGDirectDisplayID) {
         self.displayID = displayID
         if let s = CGEventSource(stateID: .hidSystemState) {
@@ -90,12 +86,6 @@ final class InputInjector {
                 logState("prox enter")
             }
         } else {
-            if penDown {
-                logState("prox exit while penDown — forcing up")
-                postTabletPoint(phase: .up, x: nil, y: nil, pressure: 0,
-                                tiltX: 0, tiltY: 0, rotation: 0)
-                penDown = false
-            }
             postProximity(entering: false, eraser: self.eraser)
             inRange = false
             logState("prox exit")
@@ -147,8 +137,6 @@ final class InputInjector {
         }
 
         markInjected()
-        lastPenEvent = Date()
-        if penDown && idleTimer == nil { startIdleTimer() }
     }
 
     private func deriveTilt(azimuth: Double, altitude: Double) -> (Double, Double) {
@@ -231,26 +219,6 @@ final class InputInjector {
                                   wheel2: Int32((dx / scale).rounded()),
                                   wheel3: 0) else { return }
         event.post(tap: .cghidEventTap)
-    }
-
-    // MARK: - Idle-timeout safety net
-
-    private func startIdleTimer() {
-        let t = DispatchSource.makeTimerSource(queue: .global(qos: .userInteractive))
-        t.schedule(deadline: .now(), repeating: .milliseconds(50))
-        t.setEventHandler { [weak self] in self?.checkIdle() }
-        t.activate()
-        idleTimer = t
-    }
-
-    private func checkIdle() {
-        guard penDown else { return }
-        if Date().timeIntervalSince(lastPenEvent) > idleTimeoutSeconds {
-            logState("idle timeout — forcing pen up")
-            postTabletPoint(phase: .up, x: nil, y: nil, pressure: 0,
-                            tiltX: 0, tiltY: 0, rotation: 0)
-            penDown = false
-        }
     }
 
     // MARK: - CGEvent posting
