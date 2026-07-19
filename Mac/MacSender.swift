@@ -117,16 +117,39 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
 
-    // Backpressure: drop frames instead of queueing latency.
-    // - pendingEncodes: cap at 1 — never pipeline hardware encodes.
-    // - pendingSends: cap at 3 — allow a small TCP pipeline; drops happen
-    //   before encode (never encode-then-discard).
+    // ── Encoder parallelism limiter (maxPendingEncodes = 1) ─────────────────
+    //
+    // VTCompressionSessionEncodeFrame returns immediately; the hardware H.264
+    // encoder runs asynchronously. If ScreenCaptureKit delivers the next frame
+    // before the previous encode callback fires, VideoToolbox will run multiple
+    // encodes in parallel inside the same session.
+    //
+    // Perfetto traces showed this is bad for latency, not good for throughput:
+    //   • encode slices overlap on the timeline (parallel work, not faster output)
+    //   • per-frame encode time climbs through the burst (head/tail: ~15 ms → ~100 ms+)
+    //   • cap→display p95 follows the slowest in-flight encode
+    //
+    // Capping pendingEncodes at 1 enforces “latest frame wins” on the encoder:
+    // skip captures while an encode is in flight (enc drops), then feed the next
+    // fresh buffer when the callback clears the slot. The H.264 reference chain
+    // stays valid (pre-encode skip → normal P-frame n→n+2); we do NOT force
+    // keyframes on enc drops.
+    //
+    // Tradeoff: lower effective fps under load, but tighter and more predictable
+    // latency — the right goal for a pen/display mirror.
+    //
+    // Separate from network backpressure below (maxPendingSends): enc drops mean
+    // “encoder busy”; net drops mean “TCP send queue full”. Same skip-before-encode
+    // path, very different implications for tuning.
     private var pendingEncodes = 0
     private let maxPendingEncodes = 1
     private var pendingSends = 0
     private let maxPendingSends = 3
     private let pipelineLock = NSLock()
-    private var dropsThisWindow = 0
+    private var dropsEncThisWindow = 0
+    private var dropsNetThisWindow = 0
+    private var dropsEncTotal = 0
+    private var dropsNetTotal = 0
     private var needsKeyframe = true
     private var connectionReady = false
     private var stopped = false
@@ -150,7 +173,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
     private var lastReceived = Date()
-    private var dropsTotal = 0
+    private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
 
     // Local cursor echo: a cursor baked into the video carries the full
     // capture→encode→stream→display latency (~30ms perceived). Instead we
@@ -672,7 +695,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let paint50 = paintSorted.isEmpty ? 0 : paintSorted[paintSorted.count / 2].rounded()
                 let paint95 = paintSorted.isEmpty ? 0 : paintSorted[min(paintSorted.count - 1, Int(Double(paintSorted.count) * 0.95))].rounded()
                 self.paintWaitWindow.removeAll(keepingCapacity: true)
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"paint50\":\(paint50),\"paint95\":\(paint95),\"capFps\":\(capFps)}")
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"paint50\":\(paint50),\"paint95\":\(paint95),\"capFps\":\(capFps)}")
             }
             self.schedulePing()
         }
@@ -818,8 +841,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // so one file holds both ends of the story.
             if let json = try? JSONSerialization.data(withJSONObject: obj),
                let line = String(data: json, encoding: .utf8) {
-                Log.info("PHONE-STATS \(line) | mac drops=\(dropsThisWindow) pending=\(pendingSends)")
-                dropsThisWindow = 0
+                Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends)")
+                dropsEncThisWindow = 0
+                dropsNetThisWindow = 0
             }
         case "hello":
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
@@ -1022,8 +1046,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         pipelineLock.unlock()
         guard drop else { return false }
-        dropsThisWindow += 1
-        dropsTotal += 1
+        switch reason {
+        case "pending_encode":
+            dropsEncThisWindow += 1
+            dropsEncTotal += 1
+        case "pending_sends":
+            dropsNetThisWindow += 1
+            dropsNetTotal += 1
+        default:
+            break
+        }
         if let traceFrameId {
             MacTrace.frameDropped(traceFrameId, reason: reason)
         }

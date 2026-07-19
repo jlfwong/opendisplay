@@ -31,7 +31,8 @@ struct PerfStats: Equatable {
     var rttMs = 0.0              // control-channel round trip
     var e2eSamples: [Double] = []  // last ~120 per-frame e2e latencies, ms
     var transport = "—"          // USB (loopback via usbmux) or WiFi
-    var macDrops = 0             // frames the Mac dropped (backpressure), total
+    var macEncDrops = 0          // Mac skipped capture: encoder busy (pending_encode)
+    var macNetDrops = 0          // Mac skipped capture: TCP queue full (pending_sends)
     var macPending = 0           // Mac send queue depth right now
     var inputP50 = 0.0           // touch sent → CGEvent injected on the Mac, ms
     var inputP95 = 0.0
@@ -98,7 +99,8 @@ final class PhoneReceiver: ObservableObject {
     private var e2eRing: [Double] = []          // per-frame, for the overlay graph
     private var statsReportCounter = 0
     private var transport = "—"
-    private var macDrops = 0
+    private var macEncDrops = 0
+    private var macNetDrops = 0
     private var macPending = 0
     private var macInputP50 = 0.0
     private var macInputP95 = 0.0
@@ -356,7 +358,15 @@ final class PhoneReceiver: ObservableObject {
             lastRttMs = rtt
         case "ping":
             // The Mac piggybacks its send-side health on liveness pings.
-            macDrops = obj["drops"] as? Int ?? macDrops
+            if let enc = obj["encDrops"] as? Int {
+                macEncDrops = enc
+            } else if let drops = obj["drops"] as? Int {
+                // Pre-split Mac builds: all drops counted as encoder-side.
+                macEncDrops = drops
+            }
+            if let net = obj["netDrops"] as? Int {
+                macNetDrops = net
+            }
             macPending = obj["pending"] as? Int ?? macPending
             macInputP50 = obj["inp50"] as? Double ?? macInputP50
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
@@ -867,7 +877,8 @@ final class PhoneReceiver: ObservableObject {
             stats.rttMs = lastRttMs
             stats.e2eSamples = e2eRing
             stats.transport = transport
-            stats.macDrops = macDrops
+            stats.macEncDrops = macEncDrops
+            stats.macNetDrops = macNetDrops
             stats.macPending = macPending
             stats.inputP50 = macInputP50
             stats.inputP95 = macInputP95
