@@ -838,6 +838,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "touch", WireInput.pencil, WireInput.proximity,
              WireInput.gesture, WireInput.barrelButton, "scroll":
+            logInputWire(obj)
             inputInjector?.handleControl(obj)
             if let t = obj["t"] as? Double {
                 let delta = Date().timeIntervalSince1970 * 1000 - t
@@ -854,6 +855,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         default:
             Log.info("unknown control message type: \(type)")
         }
+    }
+
+    private func logInputWire(_ obj: [String: Any]) {
+        guard let type = obj["type"] as? String else { return }
+        let phase = obj["phase"] as? String ?? ""
+        if type == "touch" && phase == "moved" { return }
+        if type == WireInput.pencil && (phase == "move" || phase == "hover") { return }
+        let x = obj["x"] as? Double
+        let y = obj["y"] as? Double
+        let extra = x != nil && y != nil
+            ? String(format: " @ %.3f,%.3f", x!, y!)
+            : ""
+        Log.info("[input] wire \(type) \(phase)\(extra) injector=\(inputInjector != nil)")
     }
 
     private func waitForHello() async throws -> PhoneInfo {

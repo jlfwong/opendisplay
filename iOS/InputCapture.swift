@@ -121,7 +121,7 @@ final class InputCaptureEngine: NSObject {
         let blockFinger = activeFingerTouches.count > 1
         if blockFinger {
             logCapture("block finger phase=\(phase) activeFingers=\(activeFingerTouches.count)")
-            if phase != "began", let last = lastFingerNorm {
+            if let last = lastFingerNorm {
                 onTouch?("cancelled", last.x, last.y)
             }
         }
