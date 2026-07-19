@@ -522,7 +522,7 @@ struct SettingsView: View {
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rectangle.portrait.rotate")
-                    Label("Touch: tap to click, drag to drag, two-finger pan to scroll.",
+                    Label("Touch: one finger to click/drag; two-finger pinch to zoom; two/three-finger tap for undo/redo. Apple Pencil draws with pressure and tilt; hover moves the cursor.",
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
@@ -635,10 +635,35 @@ struct VideoLayerView: UIViewRepresentable {
             view.layer.addSublayer(displayLayer)
         }
 
-        let pan = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
-        pan.minimumNumberOfTouches = 2
-        pan.maximumNumberOfTouches = 2
-        view.addGestureRecognizer(pan)
+        let capture = InputCaptureView(frame: .zero)
+        capture.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(capture)
+        NSLayoutConstraint.activate([
+            capture.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            capture.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            capture.topAnchor.constraint(equalTo: view.topAnchor),
+            capture.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        view.inputCapture = capture
+        capture.normalize = { [weak view] point in view?.normalized(point) }
+        capture.onTouch = { [weak receiver] phase, x, y in
+            receiver?.sendTouch(phase: phase, x: x, y: y)
+        }
+        capture.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation in
+            receiver?.sendPencil(phase: phase, x: x, y: y,
+                                 pressure: pressure, azimuth: azimuth,
+                                 altitude: altitude, rotation: rotation)
+        }
+        capture.onProximity = { [weak receiver] entering, eraser in
+            receiver?.sendProximity(entering: entering, eraser: eraser)
+        }
+        capture.onGesture = { [weak receiver] kind, state, scale, velocity, x, y, fingerCount in
+            receiver?.sendGesture(kind: kind, state: state, scale: scale,
+                                  velocity: velocity, x: x, y: y, fingerCount: fingerCount)
+        }
+        capture.onBarrelButton = { [weak receiver] down, x, y in
+            receiver?.sendBarrelButton(down: down, x: x, y: y)
+        }
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -659,6 +684,7 @@ struct VideoLayerView: UIViewRepresentable {
     final class VideoView: UIView {
         weak var receiver: PhoneReceiver?
         var metalRenderer: MetalVideoRenderer?
+        var inputCapture: InputCaptureView?
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -745,7 +771,7 @@ struct VideoLayerView: UIViewRepresentable {
 
         // The video is aspect-fit inside the view; map view coords into the
         // displayed video rect and normalize to [0,1].
-        private func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
+        fileprivate func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
             guard let video = receiver?.videoSize, video != .zero,
                   bounds.width > 0, bounds.height > 0 else { return nil }
             let scale = min(bounds.width / video.width, bounds.height / video.height)
@@ -756,65 +782,5 @@ struct VideoLayerView: UIViewRepresentable {
             let y = (point.y - origin.y) / size.height
             return (min(max(x, 0), 1), min(max(y, 0), 1))
         }
-
-        private var twoFingerActive = false
-        private var lastPan = CGPoint.zero
-        private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
-
-        @objc func didTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-            guard let video = receiver?.videoSize, video != .zero else { return }
-            switch recognizer.state {
-            case .began:
-                twoFingerActive = true
-                lastPan = .zero
-            case .changed:
-                let t = recognizer.translation(in: self)
-                let scale = min(bounds.width / video.width, bounds.height / video.height)
-                // Deltas in video pixels, natural-scrolling direction.
-                receiver?.sendScroll(dx: (t.x - lastPan.x) / scale,
-                                     dy: (t.y - lastPan.y) / scale)
-                lastPan = t
-            default:
-                twoFingerActive = false
-            }
-        }
-
-        private func send(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
-            // Ignore single-finger events while a two-finger gesture runs,
-            // and end the click if a second finger joins mid-press.
-            if twoFingerActive || (event?.allTouches?.count ?? 1) > 1 {
-                if phase != "began" {
-                    receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
-                }
-                return
-            }
-            guard let touch = touches.first,
-                  let norm = normalized(touch.location(in: self)) else { return }
-            lastNorm = norm
-            if phase == "moved", let event {
-                // The panel samples touches at 120Hz but UIKit delivers at
-                // display refresh — forward every coalesced sample so the Mac
-                // gets the full-rate drag, then UIKit's predicted touch so the
-                // cursor leads toward where the finger will be (~1 frame of
-                // perceived latency back; corrected by the next real sample).
-                for t in event.coalescedTouches(for: touch) ?? [touch] {
-                    if let n = normalized(t.location(in: self)) {
-                        lastNorm = n
-                        receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
-                    }
-                }
-                if let predicted = event.predictedTouches(for: touch)?.last,
-                   let n = normalized(predicted.location(in: self)) {
-                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
-                }
-                return
-            }
-            receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
-        }
-
-        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { send("began", touches, event) }
-        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { send("moved", touches, event) }
-        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { send("ended", touches, event) }
-        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send("cancelled", touches, event) }
     }
 }

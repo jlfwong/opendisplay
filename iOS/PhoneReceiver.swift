@@ -418,13 +418,57 @@ final class PhoneReceiver: ObservableObject {
     /// measure touch→injection latency without doing its own clock sync.
     func sendTouch(phase: String, x: Double, y: Double) {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
-        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
+        stampMacTime(&msg)
         sendControl(msg)
+    }
+
+    func sendPencil(phase: PencilPhase, x: Double, y: Double,
+                    pressure: Double, azimuth: Double, altitude: Double,
+                    rotation: Double) {
+        var msg: [String: Any] = [
+            "type": WireInput.pencil,
+            "phase": phase.rawValue,
+            "x": x, "y": y,
+            "pressure": pressure,
+            "azimuth": azimuth,
+            "altitude": altitude,
+            "rotation": rotation,
+        ]
+        stampMacTime(&msg)
+        sendControl(msg)
+    }
+
+    func sendProximity(entering: Bool, eraser: Bool) {
+        sendControl(["type": WireInput.proximity, "entering": entering, "eraser": eraser])
+    }
+
+    func sendGesture(kind: GestureKind, state: GestureState,
+                     scale: Double? = nil, velocity: Double? = nil,
+                     x: Double? = nil, y: Double? = nil, fingerCount: Int? = nil) {
+        var msg: [String: Any] = [
+            "type": WireInput.gesture,
+            "kind": kind.rawValue,
+            "state": state.rawValue,
+        ]
+        if let scale { msg["scale"] = scale }
+        if let velocity { msg["velocity"] = velocity }
+        if let x { msg["x"] = x }
+        if let y { msg["y"] = y }
+        if let fingerCount { msg["fingerCount"] = fingerCount }
+        sendControl(msg)
+    }
+
+    func sendBarrelButton(down: Bool, x: Double, y: Double) {
+        sendControl(["type": WireInput.barrelButton, "down": down, "x": x, "y": y])
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
     func sendScroll(dx: Double, dy: Double) {
         sendControl(["type": "scroll", "dx": dx, "dy": dy])
+    }
+
+    private func stampMacTime(_ msg: inout [String: Any]) {
+        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {

@@ -836,22 +836,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
-        case "touch":
-            if let phase = obj["phase"] as? String,
-               let x = obj["x"] as? Double,
-               let y = obj["y"] as? Double {
-                inputInjector?.handleTouch(phase: phase, x: x, y: y)
-                if let t = obj["t"] as? Double {
-                    let delta = Date().timeIntervalSince1970 * 1000 - t
-                    if delta > -50, delta < 1000 {
-                        inputLatencies.append(max(delta, 0))
-                        if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
-                    }
+        case "touch", WireInput.pencil, WireInput.proximity,
+             WireInput.gesture, WireInput.barrelButton, "scroll":
+            inputInjector?.handleControl(obj)
+            if let t = obj["t"] as? Double {
+                let delta = Date().timeIntervalSince1970 * 1000 - t
+                if delta > -50, delta < 1000 {
+                    inputLatencies.append(max(delta, 0))
+                    if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
                 }
-            }
-        case "scroll":
-            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                inputInjector?.handleScroll(dx: dx, dy: dy)
             }
         case "kf":
             // The phone's decoder lost sync (e.g. it attached mid-GOP and
