@@ -511,6 +511,10 @@ final class PhoneReceiver: ObservableObject {
                 IPadTrace.noteInputSent(inputId: inpId, devWallMs: devMs, wireMacMs: macMs)
             }
             self.sendControl(msg)
+            // Finish on pen-up — don't wait for 100 Mac SCK frames (~9s at 11fps).
+            if phase == .up {
+                IPadTrace.finishUpload { msg in self.sendControl(msg) }
+            }
         }
     }
 
