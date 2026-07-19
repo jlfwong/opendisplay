@@ -85,6 +85,25 @@ struct ChromeTraceEvent: Codable {
 
 enum TraceExporter {
 
+    /// Single process, one row per frame/input — full Mac→iPad pipeline on each row.
+    private static let pipelinePid = 1
+
+    /// Canonical phase order so merged rows read left→right as capture→glass.
+    private static let phaseOrder: [String: Int] = [
+        TracePhase.frameSck: 0,
+        TracePhase.frameEncodeWait: 10,
+        TracePhase.frameEncode: 20,
+        TracePhase.frameTcpSend: 30,
+        TracePhase.frameTcpTransit: 40,
+        TracePhase.frameRecv: 50,
+        TracePhase.frameDisplay: 60,
+        TracePhase.framePresent: 70,
+        TracePhase.frameDropped: 90,
+        TracePhase.inputEmit: 0,
+        TracePhase.inputWire: 10,
+        TracePhase.inputInject: 20,
+    ]
+
     /// Convert a merged session to Chrome Trace JSON for ui.perfetto.dev.
     static func chromeTrace(from session: TraceSession) -> ChromeTraceFile {
         chromeTraceRelative(from: session)
@@ -103,16 +122,44 @@ enum TraceExporter {
             tid: 0,
             args: ["sessionId": session.sessionId]))
 
-        for span in session.macSpans {
-            events.append(relativeSlice(span, pid: 1, side: "mac", origin: origin))
+        // Merge Mac + iPad spans onto one row per frame / input id.
+        var rows: [String: [TraceSpan]] = [:]
+        for span in session.allSpans {
+            let key = "\(span.rowKind):\(span.rowId)"
+            rows[key, default: []].append(span)
         }
-        for span in session.ipadSpans {
-            events.append(relativeSlice(span, pid: 2, side: "ipad", origin: origin))
+        let sortedKeys = rows.keys.sorted { a, b in
+            let ap = a.split(separator: ":", maxSplits: 1)
+            let bp = b.split(separator: ":", maxSplits: 1)
+            guard ap.count == 2, bp.count == 2 else { return a < b }
+            if ap[0] != bp[0] { return ap[0] < bp[0] }
+            let aid = Int(ap[1]) ?? 0
+            let bid = Int(bp[1]) ?? 0
+            return aid < bid
         }
-        events.append(contentsOf: threadNameEvents(session: session))
+        for key in sortedKeys {
+            guard var spans = rows[key] else { continue }
+            if key.hasPrefix("\(TraceRowKind.frame):") {
+                let rowId = Int(key.split(separator: ":").last ?? "") ?? 0
+                if let synthetic = synthesizeTransitSpan(rowId: rowId, spans: spans) {
+                    spans.append(synthetic)
+                }
+            }
+            let ordered = spans.sorted {
+                let lo = phaseOrder[$0.phase] ?? 999
+                let ro = phaseOrder[$1.phase] ?? 999
+                if lo != ro { return lo < ro }
+                return $0.startMs < $1.startMs
+            }
+            for span in ordered {
+                events.append(relativeSlice(span, origin: origin))
+            }
+        }
+        events.append(contentsOf: pipelineThreadNames(session: session))
         return ChromeTraceFile(traceEvents: events, metadata: [
             "opendisplay_session": session.sessionId,
             "origin_ms": String(origin),
+            "layout": "pipeline_merged",
         ])
     }
 
@@ -124,36 +171,66 @@ enum TraceExporter {
         }
     }
 
-    private static func threadNameEvents(session: TraceSession) -> [ChromeTraceEvent] {
+    /// When `frame.tcp_tx` was missing (legacy ordering bug), infer from send→recv.
+    private static func synthesizeTransitSpan(rowId: Int, spans: [TraceSpan]) -> TraceSpan? {
+        guard !spans.contains(where: { $0.phase == TracePhase.frameTcpTransit }) else { return nil }
+        guard let send = spans.first(where: { $0.phase == TracePhase.frameTcpSend }),
+              let recv = spans.first(where: { $0.phase == TracePhase.frameRecv }) else { return nil }
+        let start = send.endMs
+        let end = recv.startMs
+        guard end >= start else { return nil }
+        return TraceSpan(rowKind: TraceRowKind.frame, rowId: rowId, phase: TracePhase.frameTcpTransit,
+                         startMs: start, endMs: end, meta: ["leg": "synthesized"])
+    }
+
+    private static func side(for phase: String) -> String {
+        switch phase {
+        case TracePhase.frameSck, TracePhase.frameEncodeWait, TracePhase.frameEncode,
+             TracePhase.frameTcpSend, TracePhase.frameDropped, TracePhase.inputInject:
+            return "mac"
+        case TracePhase.frameTcpTransit, TracePhase.frameRecv, TracePhase.frameDisplay,
+             TracePhase.framePresent, TracePhase.inputEmit:
+            return "ipad"
+        default:
+            return "wire"
+        }
+    }
+
+    private static func pipelineThreadNames(session: TraceSession) -> [ChromeTraceEvent] {
         var names = Set<String>()
         var out: [ChromeTraceEvent] = []
-        func nameEvent(pid: Int, tid: Int, label: String) {
-            let key = "\(pid):\(tid)"
+        func nameEvent(tid: Int, label: String) {
+            let key = "\(tid)"
             guard !names.contains(key) else { return }
             names.insert(key)
             out.append(ChromeTraceEvent(
                 name: "thread_name", cat: "__metadata", ph: "M", ts: 0, dur: nil,
-                pid: pid, tid: tid, args: ["name": label]))
+                pid: pipelinePid, tid: tid, args: ["name": label]))
         }
-        for span in session.macSpans {
-            let label = span.rowKind == TraceRowKind.input
-                ? "input_\(span.rowId)" : "frame_\(span.rowId)"
-            nameEvent(pid: 1, tid: rowThreadId(kind: span.rowKind, rowId: span.rowId), label: label)
+        var frameIds = Set<Int>()
+        var inputIds = Set<Int>()
+        for span in session.allSpans {
+            if span.rowKind == TraceRowKind.input {
+                inputIds.insert(span.rowId)
+            } else {
+                frameIds.insert(span.rowId)
+            }
         }
-        for span in session.ipadSpans {
-            let label = span.rowKind == TraceRowKind.input
-                ? "input_\(span.rowId)" : "frame_\(span.rowId)"
-            nameEvent(pid: 2, tid: rowThreadId(kind: span.rowKind, rowId: span.rowId), label: label)
+        for id in frameIds.sorted() {
+            nameEvent(tid: rowThreadId(kind: TraceRowKind.frame, rowId: id),
+                      label: "frame_\(id)")
         }
-        nameEvent(pid: 1, tid: 0, label: "Mac (OpenDisplay)")
-        nameEvent(pid: 2, tid: 0, label: "iPad (OpenDisplay)")
+        for id in inputIds.sorted() {
+            nameEvent(tid: rowThreadId(kind: TraceRowKind.input, rowId: id),
+                      label: "input_\(id)")
+        }
+        nameEvent(tid: 0, label: "OpenDisplay pipeline")
         return out
     }
 
-    private static func relativeSlice(_ span: TraceSpan, pid: Int, side: String,
-                                      origin: Double) -> ChromeTraceEvent {
+    private static func relativeSlice(_ span: TraceSpan, origin: Double) -> ChromeTraceEvent {
         var args = span.meta ?? [:]
-        args["side"] = side
+        args["side"] = side(for: span.phase)
         args["rowId"] = String(span.rowId)
         args["duration_ms"] = String(format: "%.3f", span.durationMs)
         // Chrome trace `ts`/`dur` are microseconds; our spans are recorded in ms.
@@ -165,7 +242,7 @@ enum TraceExporter {
             ph: "X",
             ts: tsUs,
             dur: durUs,
-            pid: pid,
+            pid: pipelinePid,
             tid: rowThreadId(kind: span.rowKind, rowId: span.rowId),
             args: args)
     }

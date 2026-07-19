@@ -710,10 +710,10 @@ final class PhoneReceiver: ObservableObject {
         }
         guard !vclNALUs.isEmpty else { return }
         if let frameId {
-            IPadTrace.frameRecvStarted(frameId)
             if let sendMs, let offset = clockOffsetMs {
                 IPadTrace.noteSendMs(frameId, sendMs: sendMs, clockOffsetMs: offset)
             }
+            IPadTrace.frameRecvStarted(frameId)
         }
         // All slices of one wire frame go into ONE sample buffer.
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs, frameId: frameId)
