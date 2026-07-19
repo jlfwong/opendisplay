@@ -25,7 +25,6 @@ final class InputCaptureEngine: NSObject {
     private var activeFingerTouches: Set<ObjectIdentifier> = []
     private var penStrokes: [UInt64: PenStroke] = [:]
     private let tapMoveThreshold: CGFloat = 8
-    private var gestureActive = false
     private var lastFingerNorm: (x: Double, y: Double)?
 
     private struct PenStroke {
@@ -40,11 +39,6 @@ final class InputCaptureEngine: NSObject {
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
         hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
         view.addGestureRecognizer(hover)
-
-        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinchChanged(_:)))
-        pinch.allowedTouchTypes = [UITouch.TouchType.direct.rawValue as NSNumber]
-        pinch.cancelsTouchesInView = false
-        view.addGestureRecognizer(pinch)
 
         let twoFingerTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTapped(_:)))
         twoFingerTap.numberOfTouchesRequired = 2
@@ -89,12 +83,14 @@ final class InputCaptureEngine: NSObject {
             if !hoverInRange {
                 onProximity?(true, false)
                 hoverInRange = true
+                logCapture("hover enter")
             }
             onPencil?(.hover, nx, ny, 0, 0, .pi / 2, 0)
         case .ended, .cancelled, .failed:
             if hoverInRange {
                 onProximity?(false, false)
                 hoverInRange = false
+                logCapture("hover exit")
             }
         default:
             break
@@ -122,9 +118,12 @@ final class InputCaptureEngine: NSObject {
 
     func handle(_ touches: Set<UITouch>, event: UIEvent?, phase: String, ended: Bool) {
         trackFingerTouches(touches, ended: ended)
-        let blockFinger = gestureActive || activeFingerTouches.count > 1
-        if blockFinger, phase != "began", let last = lastFingerNorm {
-            onTouch?("cancelled", last.x, last.y)
+        let blockFinger = activeFingerTouches.count > 1
+        if blockFinger {
+            logCapture("block finger phase=\(phase) activeFingers=\(activeFingerTouches.count)")
+            if phase != "began", let last = lastFingerNorm {
+                onTouch?("cancelled", last.x, last.y)
+            }
         }
 
         for touch in touches {
@@ -163,6 +162,7 @@ final class InputCaptureEngine: NSObject {
             activePens.insert(id)
             onProximity?(true, false)
             penStrokes[id] = PenStroke(start: loc, sentDown: false)
+            logCapture("pen contact began (waiting for move/tap)")
             return
         }
 
@@ -176,6 +176,7 @@ final class InputCaptureEngine: NSObject {
                 stroke.sentDown = true
                 penStrokes[id] = stroke
                 if let (sx, sy) = norm(stroke.start) {
+                    logCapture("pen stroke down @ \(fmt(sx, sy))")
                     onPencil?(.down, sx, sy, pressure, azimuth, altitude, rotationDeg)
                 }
             }
@@ -198,12 +199,13 @@ final class InputCaptureEngine: NSObject {
         }
 
         if let stroke = penStrokes[id], !stroke.sentDown {
-            // Short tap → left click (tablet down/up), not right click.
+            logCapture("pen tap → down+up @ \(fmt(nx, ny))")
             onPencil?(.down, nx, ny, pressure, azimuth, altitude, rotationDeg)
             onPencil?(.up, nx, ny, 0, azimuth, altitude, rotationDeg)
             return
         }
 
+        logCapture("pen up @ \(fmt(nx, ny))")
         onPencil?(.up, nx, ny, 0, azimuth, altitude, rotationDeg)
     }
 
@@ -221,31 +223,33 @@ final class InputCaptureEngine: NSObject {
             }
             return
         }
-        guard let n = norm(touch.location(in: view)) else { return }
-        lastFingerNorm = (x: n.0, y: n.1)
-        onTouch?(phase, n.0, n.1)
-    }
-
-    // MARK: - Gestures
-
-    @objc private func pinchChanged(_ gr: UIPinchGestureRecognizer) {
-        guard let (nx, ny) = gestureCentroid(gr) else { return }
-        gestureActive = gr.state == .began || gr.state == .changed
-        onGesture?(.pinch, gestureState(gr.state),
-                   Double(gr.scale), Double(gr.velocity), nx, ny, nil)
-        if gr.state == .ended || gr.state == .cancelled || gr.state == .failed {
-            gestureActive = false
+        guard let n = norm(touch.location(in: view)) else {
+            logCapture("finger \(phase) DROPPED (normalize nil)")
+            return
         }
+        lastFingerNorm = (x: n.0, y: n.1)
+        if phase != "moved" { logCapture("finger \(phase) @ \(fmt(n.0, n.1))") }
+        onTouch?(phase, n.0, n.1)
     }
 
     @objc private func twoFingerTapped(_ gr: UITapGestureRecognizer) {
         guard gr.state == .ended, let (nx, ny) = gestureCentroid(gr) else { return }
+        logCapture("two-finger tap @ \(fmt(nx, ny))")
         onGesture?(.tap, .ended, nil, nil, nx, ny, 2)
     }
 
     @objc private func threeFingerTapped(_ gr: UITapGestureRecognizer) {
         guard gr.state == .ended, let (nx, ny) = gestureCentroid(gr) else { return }
+        logCapture("three-finger tap @ \(fmt(nx, ny))")
         onGesture?(.tap, .ended, nil, nil, nx, ny, 3)
+    }
+
+    private func logCapture(_ message: String) {
+        Log.info("[input] capture \(message)")
+    }
+
+    private func fmt(_ x: Double, _ y: Double) -> String {
+        String(format: "%.3f,%.3f", x, y)
     }
 
     private func gestureState(_ s: UIGestureRecognizer.State) -> GestureState {

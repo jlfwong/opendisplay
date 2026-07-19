@@ -12,7 +12,6 @@ final class InputInjector {
     private var penDown = false
     private var fingerDown = false
     private var eraser = false
-    private var lastPinchScale: Double = 1.0
 
     private let deviceID: Int64 = 1
     private let vendorID: Int64 = 0x056A
@@ -46,6 +45,7 @@ final class InputInjector {
 
     func handleControl(_ obj: [String: Any]) {
         guard let type = obj["type"] as? String else { return }
+        logRecv(type, obj)
         switch type {
         case "touch":
             if let phase = obj["phase"] as? String,
@@ -84,15 +84,18 @@ final class InputInjector {
                 postProximity(entering: true, eraser: eraser)
                 self.eraser = eraser
                 inRange = true
+                logState("prox enter")
             }
         } else {
             if penDown {
+                logState("prox exit while penDown — forcing up")
                 postTabletPoint(phase: .up, x: nil, y: nil, pressure: 0,
                                 tiltX: 0, tiltY: 0, rotation: 0)
                 penDown = false
             }
             postProximity(entering: false, eraser: self.eraser)
             inRange = false
+            logState("prox exit")
         }
     }
 
@@ -121,6 +124,7 @@ final class InputInjector {
             postTabletPoint(phase: .down, x: x, y: y, pressure: pressure,
                             tiltX: tiltX, tiltY: tiltY, rotation: rotation)
             penDown = true
+            logState("pencil down p=\(String(format: "%.2f", pressure))")
         case .move:
             if penDown {
                 postTabletPoint(phase: .drag, x: x, y: y, pressure: pressure,
@@ -133,6 +137,7 @@ final class InputInjector {
             postTabletPoint(phase: .up, x: x, y: y, pressure: 0,
                             tiltX: tiltX, tiltY: tiltY, rotation: rotation)
             penDown = false
+            logState("pencil up")
         case .hover:
             postTabletPoint(phase: .hover, x: x, y: y, pressure: 0,
                             tiltX: tiltX, tiltY: tiltY, rotation: rotation)
@@ -156,13 +161,19 @@ final class InputInjector {
         case "began":
             type = .leftMouseDown
             fingerDown = true
+            logState("finger began @ \(fmt(p))")
         case "moved":
             type = fingerDown ? .leftMouseDragged : .mouseMoved
         case "ended", "cancelled":
-            guard fingerDown else { return }
+            guard fingerDown else {
+                logState("finger \(phase) IGNORED (not down) @ \(fmt(p))")
+                return
+            }
             type = .leftMouseUp
             fingerDown = false
+            logState("finger \(phase) @ \(fmt(p))")
         default:
+            logState("finger unknown phase \(phase)")
             return
         }
         postMouse(type: type, at: p, button: .left)
@@ -177,38 +188,23 @@ final class InputInjector {
               let state = GestureState(rawValue: stateStr) else { return }
 
         switch kind {
-        case .pinch:
-            handlePinch(state: state,
-                        scale: obj["scale"] as? Double ?? 1,
-                        x: obj["x"] as? Double,
-                        y: obj["y"] as? Double)
         case .tap:
             handleTapGesture(state: state, fingerCount: obj["fingerCount"] as? Int)
+        case .pinch:
+            logState("pinch gesture ignored (disabled)")
         case .rotate, .pan, .longPress, .swipe:
             break
         }
-    }
-
-    private func handlePinch(state: GestureState, scale: Double, x: Double?, y: Double?) {
-        if state == .began {
-            lastPinchScale = scale
-            return
-        }
-        guard state == .changed || state == .ended else { return }
-        let delta = scale - lastPinchScale
-        lastPinchScale = scale
-        if abs(delta) < 0.0001 { return }
-        let center = screenPoint(nx: x ?? 0.5, ny: y ?? 0.5)
-        postMagnify(magnification: delta, at: center)
-        if state == .ended { lastPinchScale = 1.0 }
     }
 
     private func handleTapGesture(state: GestureState, fingerCount: Int?) {
         guard state == .ended else { return }
         switch fingerCount {
         case 2:
+            logState("gesture undo (Cmd+Z)")
             postKeyCommand(keyCode: 0x06, flags: .command)
         case 3:
+            logState("gesture redo (Cmd+Shift+Z)")
             postKeyCommand(keyCode: 0x06, flags: [.command, .shift])
         default:
             break
@@ -216,6 +212,7 @@ final class InputInjector {
     }
 
     private func handleBarrelButton(down: Bool, x: Double?, y: Double?) {
+        logState("barrelButton down=\(down) x=\(x ?? -1) y=\(y ?? -1)")
         postRightClick(down: down, x: x, y: y)
     }
 
@@ -244,6 +241,7 @@ final class InputInjector {
     private func checkIdle() {
         guard penDown else { return }
         if Date().timeIntervalSince(lastPenEvent) > idleTimeoutSeconds {
+            logState("idle timeout — forcing pen up")
             postTabletPoint(phase: .up, x: nil, y: nil, pressure: 0,
                             tiltX: 0, tiltY: 0, rotation: 0)
             penDown = false
@@ -268,6 +266,7 @@ final class InputInjector {
         ev.setIntegerValueField(.tabletProximityEventCapabilityMask, value: capabilityMask)
         ev.setIntegerValueField(.tabletProximityEventPointerType, value: eraser ? 3 : 1)
         ev.setIntegerValueField(.tabletProximityEventEnterProximity, value: entering ? 1 : 0)
+        logPost("tabletProximity entering=\(entering) eraser=\(eraser)", flags: ev.flags)
         ev.post(tap: .cghidEventTap)
     }
 
@@ -300,6 +299,10 @@ final class InputInjector {
         if phase == .down || phase == .up {
             ev.setIntegerValueField(.mouseEventClickState, value: 1)
         }
+        if phase == .down || phase == .up {
+            logPost("tablet \(phase) p=\(String(format: "%.2f", pressure))", at: p, button: .left,
+                     subtype: "tabletPoint", flags: ev.flags)
+        }
         ev.post(tap: .cghidEventTap)
     }
 
@@ -307,6 +310,10 @@ final class InputInjector {
         guard let ev = CGEvent(mouseEventSource: source, mouseType: type,
                                mouseCursorPosition: p, mouseButton: button) else { return }
         ev.setIntegerValueField(.mouseEventClickState, value: 1)
+        let isMove = type == .leftMouseDragged || type == .mouseMoved
+        if !isMove || button == .right {
+            logPost("mouse \(type.rawValue)", at: p, button: button, flags: ev.flags)
+        }
         ev.post(tap: .cghidEventTap)
     }
 
@@ -318,28 +325,17 @@ final class InputInjector {
         postMouse(type: type, at: p, button: .right)
     }
 
-    private func postMagnify(magnification: Double, at point: CGPoint) {
-        CGWarpMouseCursorPosition(point)
-        let scrollDelta = magnification * 512.0
-        guard let ev = CGEvent(scrollWheelEvent2Source: source,
-                               units: .pixel,
-                               wheelCount: 1,
-                               wheel1: Int32(scrollDelta.rounded()),
-                               wheel2: 0,
-                               wheel3: 0) else { return }
-        ev.flags = .maskControl
-        ev.post(tap: .cghidEventTap)
-    }
-
     private func postKeyCommand(keyCode: UInt16, flags: NSEvent.ModifierFlags) {
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode),
                                  keyDown: true) else { return }
         down.flags = CGEventFlags(rawValue: UInt64(flags.rawValue))
+        logPost("keyDown vk=\(keyCode)", flags: down.flags)
         down.post(tap: .cghidEventTap)
 
         guard let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode),
                                keyDown: false) else { return }
         up.flags = CGEventFlags(rawValue: UInt64(flags.rawValue))
+        logPost("keyUp vk=\(keyCode)", flags: up.flags)
         up.post(tap: .cghidEventTap)
     }
 
@@ -353,5 +349,62 @@ final class InputInjector {
 
     private func currentCursor() -> CGPoint {
         CGEvent(source: source)?.location ?? .zero
+    }
+
+    // MARK: - Input debug logging
+
+    private func logRecv(_ type: String, _ obj: [String: Any]) {
+        switch type {
+        case "touch":
+            if let phase = obj["phase"] as? String,
+               let x = obj["x"] as? Double, let y = obj["y"] as? Double {
+                if phase != "moved" {
+                    Log.info("[input] recv touch \(phase) @ \(fmtPt(x, y)) | \(stateLine())")
+                }
+            }
+        case WireInput.pencil:
+            let phase = obj["phase"] as? String ?? "?"
+            if phase != "move" && phase != "hover" {
+                let x = obj["x"] as? Double ?? 0, y = obj["y"] as? Double ?? 0
+                let p = obj["pressure"] as? Double ?? 0
+                Log.info("[input] recv pencil \(phase) @ \(fmtPt(x, y)) p=\(String(format: "%.2f", p)) | \(stateLine())")
+            }
+        case WireInput.proximity:
+            Log.info("[input] recv proximity entering=\(obj["entering"] ?? "?") eraser=\(obj["eraser"] ?? "?") | \(stateLine())")
+        case WireInput.gesture:
+            Log.info("[input] recv gesture \(obj["kind"] ?? "?") \(obj["state"] ?? "?") fingers=\(obj["fingerCount"] ?? "-") | \(stateLine())")
+        case WireInput.barrelButton:
+            Log.info("[input] recv barrelButton down=\(obj["down"] ?? "?") | \(stateLine())")
+        default:
+            break
+        }
+    }
+
+    private func logState(_ note: String) {
+        Log.info("[input] \(note) | \(stateLine())")
+    }
+
+    private func stateLine() -> String {
+        "state penDown=\(penDown) fingerDown=\(fingerDown) inRange=\(inRange)"
+    }
+
+    private func fmt(_ p: CGPoint) -> String {
+        "\(Int(p.x)),\(Int(p.y))"
+    }
+
+    private func fmtPt(_ x: Double, _ y: Double) -> String {
+        let p = screenPoint(nx: x, ny: y)
+        return fmt(p)
+    }
+
+    private func logPost(_ label: String, at p: CGPoint? = nil, button: CGMouseButton? = nil,
+                         subtype: String? = nil, flags: CGEventFlags = []) {
+        var parts = [label]
+        if let p { parts.append("@ \(fmt(p))") }
+        if let button { parts.append("btn=\(button.rawValue)") }
+        if let subtype { parts.append("sub=\(subtype)") }
+        if !flags.isEmpty { parts.append("flags=0x\(String(flags.rawValue, radix: 16))") }
+        parts.append("| \(stateLine())")
+        Log.info("[input] post " + parts.joined(separator: " "))
     }
 }

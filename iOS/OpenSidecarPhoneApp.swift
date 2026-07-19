@@ -522,7 +522,7 @@ struct SettingsView: View {
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rectangle.portrait.rotate")
-                    Label("Touch: one finger to click/drag; two-finger pinch to zoom; two/three-finger tap for undo/redo. Apple Pencil draws with pressure and tilt; hover moves the cursor.",
+                    Label("Touch: one finger to click/drag; two/three-finger tap for undo/redo. Apple Pencil draws with pressure and tilt; hover moves the cursor.",
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
