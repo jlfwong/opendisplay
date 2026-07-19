@@ -26,6 +26,7 @@ final class InputCaptureEngine: NSObject {
     private var penStrokes: [UInt64: PenStroke] = [:]
     private let tapMoveThreshold: CGFloat = 8
     private var lastFingerNorm: (x: Double, y: Double)?
+    private var sentCancelForBlock = false
 
     private struct PenStroke {
         var start: CGPoint
@@ -120,10 +121,13 @@ final class InputCaptureEngine: NSObject {
         trackFingerTouches(touches, ended: ended)
         let blockFinger = activeFingerTouches.count > 1
         if blockFinger {
-            logCapture("block finger phase=\(phase) activeFingers=\(activeFingerTouches.count)")
-            if let last = lastFingerNorm {
+            if !sentCancelForBlock, let last = lastFingerNorm {
+                logCapture("block finger phase=\(phase) activeFingers=\(activeFingerTouches.count) — cancel once")
                 onTouch?("cancelled", last.x, last.y)
+                sentCancelForBlock = true
             }
+        } else {
+            sentCancelForBlock = false
         }
 
         for touch in touches {

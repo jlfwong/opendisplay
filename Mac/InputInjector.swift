@@ -155,10 +155,6 @@ final class InputInjector {
     // MARK: - Touch (single-finger mouse)
 
     func handleTouch(phase: String, x: Double, y: Double) {
-        if phase == "began" {
-            releaseStuckModifiers()
-            ensureRightButtonUp(at: screenPoint(nx: x, ny: y))
-        }
         let p = screenPoint(nx: x, ny: y)
         let type: CGEventType
         switch phase {
@@ -303,6 +299,7 @@ final class InputInjector {
         if phase == .down || phase == .up {
             ev.setIntegerValueField(.mouseEventClickState, value: 1)
         }
+        ev.flags = .maskNonCoalesced
         if phase == .down || phase == .up {
             logPost("tablet \(phase) p=\(String(format: "%.2f", pressure))", at: p, button: .left,
                      subtype: "tabletPoint", flags: ev.flags)
@@ -314,6 +311,8 @@ final class InputInjector {
         guard let ev = CGEvent(mouseEventSource: source, mouseType: type,
                                mouseCursorPosition: p, mouseButton: button) else { return }
         ev.setIntegerValueField(.mouseEventClickState, value: 1)
+        // Don't inherit stale modifier / secondary-button state from the event source.
+        ev.flags = .maskNonCoalesced
         let isMove = type == .leftMouseDragged || type == .mouseMoved
         if !isMove || button == .right {
             logPost("mouse \(type.rawValue)", at: p, button: button, flags: ev.flags)
@@ -340,26 +339,6 @@ final class InputInjector {
                                keyDown: false) else { return }
         up.flags = CGEventFlags(rawValue: UInt64(flags.rawValue))
         logPost("keyUp vk=\(keyCode)", flags: up.flags)
-        up.post(tap: .cghidEventTap)
-    }
-
-    /// Safety net: synthetic modifier key-ups clear a stuck Control/Cmd/etc.
-    /// that would turn subsequent clicks into right-clicks or chorded shortcuts.
-    private func releaseStuckModifiers() {
-        let modifierKeyCodes: [CGKeyCode] = [0x3B, 0x3E, 0x37, 0x38, 0x3A, 0x3C]
-        for keyCode in modifierKeyCodes {
-            guard let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode,
-                                   keyDown: false) else { continue }
-            up.post(tap: .cghidEventTap)
-        }
-        logState("releaseStuckModifiers")
-    }
-
-    private func ensureRightButtonUp(at p: CGPoint) {
-        guard let up = CGEvent(mouseEventSource: source, mouseType: .rightMouseUp,
-                               mouseCursorPosition: p, mouseButton: .right) else { return }
-        up.setIntegerValueField(.mouseEventClickState, value: 1)
-        logPost("mouse \(CGEventType.rightMouseUp.rawValue)", at: p, button: .right)
         up.post(tap: .cghidEventTap)
     }
 
