@@ -70,7 +70,7 @@ final class PhoneReceiver: ObservableObject {
     private var connection: NWConnection?
     private var traceConnection: NWConnection?
     private var pendingTraceMessages: [[String: Any]] = []
-    private let queue = DispatchQueue(label: "receiver.video")
+    private let queue = DispatchQueue(label: "receiver.video", qos: .userInteractive)
     private static let queueKey = DispatchSpecificKey<UInt8>()
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?

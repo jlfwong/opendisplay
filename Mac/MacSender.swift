@@ -107,7 +107,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let traceQueue = DispatchQueue(label: "sender.trace", qos: .utility)
     private var traceConnectionReady = false
     private var virtualDisplay: VirtualDisplay?
-    private let queue = DispatchQueue(label: "sender.video")
+    private let queue = DispatchQueue(label: "sender.video", qos: .userInteractive)
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     private var controlPort: UInt16 {
@@ -583,6 +583,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         let params = NWParameters(tls: nil, tcp: options)
+        params.serviceClass = .interactiveVideo
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         conn.stateUpdateHandler = { [weak self] state in
