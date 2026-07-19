@@ -390,28 +390,13 @@ enum TraceWire {
 
 enum TraceFileWriter {
 
-    private static let checkpointSpanInterval = 150
-
-    /// Write Perfetto-loadable JSON + raw session JSON under `/tmp`.
-    static func write(session: TraceSession, partial: Bool = false) throws -> (perfetto: URL, raw: URL) {
+    /// Write Perfetto-loadable JSON + raw session JSON under `/tmp` (pen up only).
+    static func write(session: TraceSession) throws -> (perfetto: URL, raw: URL) {
         let stamp = session.sessionId.prefix(8)
-        let suffix = partial ? ".partial" : ""
-        let perfettoURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp)\(suffix).perfetto.json")
-        let rawURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp)\(suffix).session.json")
+        let perfettoURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp).perfetto.json")
+        let rawURL = URL(fileURLWithPath: "/tmp/opendisplay-trace-\(stamp).session.json")
         try TraceExporter.jsonData(from: session, relativeTimeline: true).write(to: perfettoURL)
         try TraceExporter.sessionJSON(from: session).write(to: rawURL)
         return (perfettoURL, rawURL)
-    }
-
-    /// Durability checkpoint during long strokes.
-    @discardableResult
-    static func checkpointIfNeeded(session: TraceSession, ipadSpanCount: Int) -> URL? {
-        guard ipadSpanCount > 0, ipadSpanCount % checkpointSpanInterval == 0 else { return nil }
-        do {
-            let urls = try write(session: session, partial: true)
-            return urls.raw
-        } catch {
-            return nil
-        }
     }
 }

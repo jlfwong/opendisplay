@@ -47,18 +47,7 @@ enum MacTrace {
         guard !finalizedSessions.contains(sessionId) else { return }
         traceWorkQueue.async {
             guard !finalizedSessions.contains(sessionId) else { return }
-            let added = TraceCollector.shared.ingestIPadSpans(spans, seq: seq)
-            guard added > 0 else { return }
-            let now = Date().timeIntervalSince1970 * 1000
-            let session = TraceCollector.shared.buildPartialSession(endedAtMs: now)
-            guard session.sessionId == sessionId else {
-                Log.info("[trace] span batch session mismatch got=\(sessionId.prefix(8)) have=\(session.sessionId.prefix(8))")
-                return
-            }
-            if let url = TraceFileWriter.checkpointIfNeeded(session: session,
-                                                            ipadSpanCount: session.ipadSpans.count) {
-                Log.info("[trace] checkpoint \(session.ipadSpans.count) iPad spans → \(url.path)")
-            }
+            _ = TraceCollector.shared.ingestIPadSpans(spans, seq: seq)
         }
     }
 
