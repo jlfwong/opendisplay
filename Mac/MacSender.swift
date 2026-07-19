@@ -118,13 +118,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let displaySerial: UInt32
 
     // Backpressure: drop frames instead of queueing latency.
-    // - pendingEncodes: VTCompressionSession is async; cap at 1 so we never
-    //   pipeline multiple hardware encodes (parallel encodes spike latency).
-    // - pendingSends: cap at 1 so the socket can't build a multi-frame backlog.
+    // - pendingEncodes: cap at 1 — never pipeline hardware encodes.
+    // - pendingSends: cap at 3 — allow a small TCP pipeline; drops happen
+    //   before encode (never encode-then-discard).
     private var pendingEncodes = 0
     private let maxPendingEncodes = 1
     private var pendingSends = 0
-    private let maxPendingSends = 1
+    private let maxPendingSends = 3
     private let pipelineLock = NSLock()
     private var dropsThisWindow = 0
     private var needsKeyframe = true
