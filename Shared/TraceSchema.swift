@@ -99,6 +99,9 @@ enum TraceExporter {
     /// Single process, one row per frame/input — full Mac→iPad pipeline on each row.
     private static let pipelinePid = 1
 
+    /// Input traces capture every event down→up; Perfetto export keeps the tail only.
+    static let inputExportRowLimit = 200
+
     /// Canonical phase order so merged rows read left→right as capture→glass.
     private static let phaseOrder: [String: Int] = [
         TracePhase.frameSck: 0,
@@ -126,7 +129,8 @@ enum TraceExporter {
     }
 
     static func chromeTraceRelative(from session: TraceSession) -> ChromeTraceFile {
-        let origin = session.allSpans.map(\.startMs).min() ?? session.startedAtMs
+        let export = trimmedForPerfetto(session)
+        let origin = export.allSpans.map(\.startMs).min() ?? export.startedAtMs
         var events: [ChromeTraceEvent] = []
         events.append(ChromeTraceEvent(
             name: "session_start",
@@ -140,7 +144,7 @@ enum TraceExporter {
 
         // Merge Mac + iPad spans onto one row per frame / input id.
         var rows: [String: [TraceSpan]] = [:]
-        for span in session.allSpans {
+        for span in export.allSpans {
             let key = "\(span.rowKind):\(span.rowId)"
             rows[key, default: []].append(span)
         }
@@ -171,12 +175,39 @@ enum TraceExporter {
                 events.append(relativeSlice(span, origin: origin))
             }
         }
-        events.append(contentsOf: pipelineThreadNames(session: session))
-        return ChromeTraceFile(traceEvents: events, metadata: [
-            "opendisplay_session": session.sessionId,
+        events.append(contentsOf: pipelineThreadNames(session: export))
+        var metadata: [String: String] = [
+            "opendisplay_session": export.sessionId,
             "origin_ms": String(origin),
             "layout": "pipeline_merged",
-        ])
+        ]
+        let totalInput = Set(session.allSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId)).count
+        let exportedInput = Set(export.allSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId)).count
+        if totalInput > 0 {
+            metadata["input_rows_total"] = String(totalInput)
+            metadata["input_rows_exported"] = String(exportedInput)
+            metadata["input_export_tail"] = String(inputExportRowLimit)
+        }
+        return ChromeTraceFile(traceEvents: events, metadata: metadata)
+    }
+
+    /// Keep all frame rows; for input rows export only the last N (by row id).
+    static func trimmedForPerfetto(_ session: TraceSession) -> TraceSession {
+        let inputIds = Set(session.allSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId))
+        guard inputIds.count > inputExportRowLimit else { return session }
+        let keep = Set(inputIds.sorted().suffix(inputExportRowLimit))
+        func keepSpan(_ span: TraceSpan) -> Bool {
+            span.rowKind != TraceRowKind.input || keep.contains(span.rowId)
+        }
+        return TraceSession(
+            sessionId: session.sessionId,
+            startedAtMs: session.startedAtMs,
+            endedAtMs: session.endedAtMs,
+            clockOffsetMs: session.clockOffsetMs,
+            maxFrames: session.maxFrames,
+            macSpans: session.macSpans.filter(keepSpan),
+            ipadSpans: session.ipadSpans.filter(keepSpan),
+            notes: session.notes + ["perfetto export: last \(inputExportRowLimit) of \(inputIds.count) input rows"])
     }
 
     /// Row → Perfetto thread id. One tid per frame / per input event.

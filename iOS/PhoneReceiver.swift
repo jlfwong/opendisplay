@@ -544,7 +544,7 @@ final class PhoneReceiver: ObservableObject {
     private func shouldTraceInput(phase: String) -> Bool {
         guard TraceCollector.shared.tracesInput else { return false }
         if phase == "hover" { return false }
-        return TraceCollector.shared.consumeInputBudget()
+        return true
     }
 
     func sendProximity(entering: Bool, eraser: Bool) {

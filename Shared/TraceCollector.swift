@@ -20,7 +20,7 @@ final class TraceCollector {
     private var ipadSpans: [TraceSpan] = []
     private var notes: [String] = []
     private var clockOffsetMs: Double = 0
-    private let maxSpans = 8_000
+    private let maxSpans = 100_000
 
     /// Per-frame open interval start markers (Mac clock ms).
     private var frameMarks: [Int: [String: Double]] = [:]
@@ -92,7 +92,7 @@ final class TraceCollector {
     var tracesInput: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return active && mode == .input && inputBudget > 0
+        return active && mode == .input
     }
 
     var traceMode: TraceMode {
@@ -130,6 +130,14 @@ final class TraceCollector {
             notes.append("frame budget exhausted")
         }
         return true
+    }
+
+    func inputRowCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let ids = Set(macSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId))
+        let ids2 = Set(ipadSpans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId))
+        return ids.union(ids2).count
     }
 
     func setClockOffset(_ ms: Double) {

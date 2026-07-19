@@ -20,18 +20,17 @@ enum IPadTrace {
         sendMsByFrame.removeAll(keepingCapacity: true)
     }
 
-    /// Pen down → input trace until pen up (one stroke, up to maxInputs events).
+    /// Pen down → input trace until pen up — all events captured; Perfetto exports tail.
     static func beginOnPenDown(clockOffsetMs: Double?, sendStart: (_ msg: [String: Any]) -> Void) {
         guard !TraceCollector.shared.isActive else { return }
         let sessionId = UUID().uuidString
-        let maxInputs = 150
         let now = Date().timeIntervalSince1970 * 1000
         let offset = clockOffsetMs ?? 0
         _ = TraceCollector.shared.start(.init(
             sessionId: sessionId,
             mode: .input,
             maxFrames: 0,
-            maxInputs: maxInputs,
+            maxInputs: 0,
             clockOffsetMs: offset,
             startedAtMs: TraceCollector.shared.ipadUnifiedMs(wallMs: now)))
         lock.lock()
@@ -40,10 +39,10 @@ enum IPadTrace {
         resetSessionState()
         lock.unlock()
         var msg = TraceWire.startMessage(sessionId: sessionId, mode: .input,
-                                         maxFrames: 0, maxInputs: maxInputs)
+                                         maxFrames: 0, maxInputs: 0)
         if clockOffsetMs != nil { msg["clockOffset"] = offset }
         sendStart(msg)
-        Log.info("[trace] iPad input session started id=\(sessionId.prefix(8)) — stroke up to \(maxInputs) events")
+        Log.info("[trace] iPad input session started id=\(sessionId.prefix(8)) — all events until pen up")
     }
 
     static func handleTraceStop(sessionId: String, upload: @escaping (_ msg: [String: Any]) -> Void) {
@@ -149,7 +148,7 @@ enum IPadTrace {
                 return
             }
             if let payload = try? JSONSerialization.data(withJSONObject: msg),
-               payload.count > 900_000 {
+               payload.count > 4_000_000 {
                 Log.info("[trace] upload too large (\(payload.count) bytes) — skipping wire upload")
                 return
             }
