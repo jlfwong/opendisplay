@@ -42,7 +42,6 @@ struct ReceiverScreen: View {
     @State private var showOnboarding = false
     @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
@@ -77,15 +76,13 @@ struct ReceiverScreen: View {
                                    useMetal: metalRenderer)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
                         .ignoresSafeArea()
-                    if showAnalytics {
-                        VStack {
-                            Spacer()
-                            PerfOverlay(stats: model.receiver.perf,
-                                        videoSize: model.receiver.videoSize)
-                                .padding(.bottom, 10)
-                        }
-                        .allowsHitTesting(false)   // never block touch input
+                    VStack {
+                        Spacer()
+                        PerfOverlay(stats: model.receiver.perf,
+                                    videoSize: model.receiver.videoSize)
+                            .padding(.bottom, 10)
                     }
+                    .allowsHitTesting(false)
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
@@ -475,7 +472,6 @@ struct BarGraph: View {
 struct SettingsView: View {
     @ObservedObject var receiver: PhoneReceiver
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
     @AppStorage(LatencyTelemetry.detailedLogKey) private var latencyLog = false
 
@@ -510,7 +506,6 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("Performance overlay", isOn: $showAnalytics)
                     Toggle("Metal renderer (experimental)", isOn: $metalRenderer)
                     Toggle("Latency detail log", isOn: $latencyLog)
                 } header: {
