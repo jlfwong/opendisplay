@@ -349,6 +349,7 @@ final class PhoneReceiver: ObservableObject {
             if offsetSamples.count > 15 { offsetSamples.removeFirst() }
             if let best = offsetSamples.min(by: { $0.rtt < $1.rtt }) {
                 clockOffsetMs = best.offset
+                IPadTrace.setClockOffset(best.offset)
             }
             lastRttMs = rtt
         case "ping":
@@ -388,6 +389,12 @@ final class PhoneReceiver: ObservableObject {
                 ?? "Update OpenDisplay from the App Store to keep using your second display."
             let store = (obj["store"] as? String).flatMap { URL(string: $0) } ?? AppStore.updateURL
             DispatchQueue.main.async { self.peerSignal = .updateIPhone(message: message, storeURL: store) }
+        case WireTrace.traceStop:
+            if let sessionId = obj["sessionId"] as? String {
+                IPadTrace.handleTraceStop(sessionId: sessionId) { [weak self] msg in
+                    self?.sendControl(msg)
+                }
+            }
         default:
             break
         }
@@ -465,8 +472,19 @@ final class PhoneReceiver: ObservableObject {
     func sendPencil(phase: PencilPhase, x: Double, y: Double,
                     pressure: Double, azimuth: Double, altitude: Double,
                     rotation: Double) {
+        if phase == .down {
+            IPadTrace.beginOnPenDown(clockOffsetMs: clockOffsetMs) { [weak self] msg in
+                self?.sendControl(msg)
+            }
+        }
         let devMs = nowMs
         let macMs = clockOffsetMs.map { devMs + $0 }
+        var inpId: Int?
+        if TraceCollector.shared.isActive, phase != .hover {
+            let id = IPadTrace.nextInputId()
+            inpId = id
+            IPadTrace.noteInputEmit(inputId: id, devWallMs: devMs)
+        }
         var msg: [String: Any] = [
             "type": WireInput.pencil,
             "phase": phase.rawValue,
@@ -478,10 +496,14 @@ final class PhoneReceiver: ObservableObject {
             "tDev": devMs,
         ]
         if let macMs { msg["t"] = macMs }
+        if let inpId { msg["inpId"] = inpId }
         queue.async {
             if phase != .hover, let macMs {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
+            }
+            if let inpId {
+                IPadTrace.noteInputSent(inputId: inpId, devWallMs: devMs, wireMacMs: macMs)
             }
             self.sendControl(msg)
         }
@@ -639,10 +661,12 @@ final class PhoneReceiver: ObservableObject {
 
         var captureMs: Double?
         var sendMs: Double?
+        var frameId: Int?
         if let metaPrefix,
            let meta = try? JSONSerialization.jsonObject(with: metaPrefix) as? [String: Any] {
             captureMs = meta["cap"] as? Double
             sendMs = meta["snd"] as? Double
+            frameId = meta["fid"] as? Int
         }
 
         var vclNALUs: [Data] = []
@@ -668,8 +692,14 @@ final class PhoneReceiver: ObservableObject {
             buildFormatDescription(sps: sps, pps: pps)
         }
         guard !vclNALUs.isEmpty else { return }
+        if let frameId {
+            IPadTrace.frameRecvStarted(frameId)
+            if let sendMs, let offset = clockOffsetMs {
+                IPadTrace.noteSendMs(frameId, sendMs: sendMs, clockOffsetMs: offset)
+            }
+        }
         // All slices of one wire frame go into ONE sample buffer.
-        enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+        enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs, frameId: frameId)
     }
 
     private func buildFormatDescription(sps: Data, pps: Data) {
@@ -702,7 +732,8 @@ final class PhoneReceiver: ObservableObject {
         }
     }
 
-    private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil, sendMs: Double? = nil) {
+    private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil,
+                              sendMs: Double? = nil, frameId: Int? = nil) {
         guard let formatDesc else { return }
 
         // Build one AVCC buffer: each NALU prefixed with 4-byte big-endian length.
@@ -745,6 +776,8 @@ final class PhoneReceiver: ObservableObject {
 
         guard let sample else { return }
 
+        if let frameId { IPadTrace.frameParseDone(frameId) }
+
         if loggedDisplayPath != (useMetalPath && onDecodedFrame != nil) {
             loggedDisplayPath = useMetalPath && onDecodedFrame != nil
             Log.info("display path: metal=\(useMetalPath) sink=\(onDecodedFrame != nil)")
@@ -768,6 +801,8 @@ final class PhoneReceiver: ObservableObject {
             }
             displayLayer.enqueue(sample)
         }
+
+        if let frameId { IPadTrace.frameDisplayed(frameId) }
 
         // Per-frame timing for the performance overlay.
         let now = Date()

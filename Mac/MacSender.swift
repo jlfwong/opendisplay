@@ -843,10 +843,30 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
+        case WireTrace.traceStart:
+            if let sessionId = obj["sessionId"] as? String,
+               let maxFrames = obj["maxFrames"] as? Int {
+                let offset = obj["clockOffset"] as? Double ?? 0
+                MacTrace.handleTraceStart(sessionId: sessionId, maxFrames: maxFrames,
+                                          clockOffsetMs: offset)
+            }
+        case WireTrace.traceUpload:
+            if let parsed = TraceWire.decodeUpload(obj) {
+                MacTrace.handleTraceUpload(sessionId: parsed.sessionId, spans: parsed.spans)
+            }
         case "touch", WireInput.pencil, WireInput.proximity,
              WireInput.gesture, WireInput.barrelButton, "scroll":
             logInputWire(obj)
+            let inpId = obj["inpId"] as? Int
+            let wireMacMs = obj["t"] as? Double
+            if let inpId, let wireMacMs {
+                MacTrace.inputReceived(inputId: inpId, wireStartMs: wireMacMs)
+            }
+            let injectStart = Date().timeIntervalSince1970 * 1000
             inputInjector?.handleControl(obj)
+            if let inpId {
+                MacTrace.inputInjected(inputId: inpId, injectStartMs: injectStart)
+            }
             if let t = obj["t"] as? Double {
                 let delta = Date().timeIntervalSince1970 * 1000 - t
                 if delta > -50, delta < 1000 {
@@ -961,18 +981,26 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         // No receiver, or the socket is backed up: skip this frame entirely.
         guard connectionReady else { return }
+        let traceFrameId = MacTrace.frameCaptured { [weak self] json in
+            self?.sendJSONFrame(json)
+        }
         if pendingSends > maxPendingSends {
             needsKeyframe = true   // dropped frames break the P-frame chain
             dropsThisWindow += 1
             dropsTotal += 1
+            if let traceFrameId {
+                MacTrace.frameDropped(traceFrameId, reason: "pending_sends")
+            }
             return
         }
 
-        encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+                 traceFrameId: traceFrameId)
     }
 
-    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, traceFrameId: Int? = nil) {
         guard let encoder else { return }
+        if let traceFrameId { MacTrace.encodeSubmitted(traceFrameId) }
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
         if needsKeyframe {
@@ -988,10 +1016,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             infoFlagsOut: nil
         ) { [weak self] status, _, buffer in
             guard status == noErr, let buffer, let self else { return }
+            if let traceFrameId { MacTrace.encodeFinished(traceFrameId) }
             if let data = self.annexB(from: buffer) {
-                // Telemetry prefix before the first start code — the receiver
-                // parses it and skips to the H.264 payload. cap = capture time,
-                // snd = handoff to the socket (so cap→snd ≈ encode duration).
                 let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
                 let encMs = sndMs - capturedAtMs
                 if LatencyTelemetry.detailedLogEnabled,
@@ -999,9 +1025,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.lastLatencyEncLog = Date()
                     Log.info("\(LatencyTelemetry.logPrefix) enc cap=\(capturedAtMs) snd=\(sndMs) encMs=\(encMs) pending=\(self.pendingSends)")
                 }
-                var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs)}".utf8)
+                if let traceFrameId { MacTrace.sendStarted(traceFrameId) }
+                let prefix = MacTrace.telemetryPrefix(frameId: traceFrameId,
+                                                      captureMs: capturedAtMs, sendMs: sndMs)
+                var framed = Data(prefix.utf8)
                 framed.append(data)
-                self.sendFramed(framed)
+                self.sendFramed(framed, traceFrameId: traceFrameId)
             }
         }
     }
@@ -1091,7 +1120,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection.send(content: frame, completion: .contentProcessed { _ in })
     }
 
-    private func sendFramed(_ payload: Data) {
+    private func sendFramed(_ payload: Data, traceFrameId: Int? = nil) {
         guard let connection, connectionReady else { return }
         var header = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &header, count: 4)
@@ -1100,6 +1129,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.pendingSends -= 1
+            if let traceFrameId { MacTrace.sendFinished(traceFrameId) }
             if let error {
                 Log.info("send error: \(error)")
                 return
