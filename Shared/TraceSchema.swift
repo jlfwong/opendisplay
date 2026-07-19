@@ -68,7 +68,7 @@ enum TraceRowKind {
 
 struct ChromeTraceFile: Codable {
     var traceEvents: [ChromeTraceEvent]
-    var displayTimeUnit: String = "ms"
+    /// Chrome/Perfetto interpret `ts`/`dur` as microseconds — do not set "ms".
     var metadata: [String: String]?
 }
 
@@ -155,12 +155,16 @@ enum TraceExporter {
         var args = span.meta ?? [:]
         args["side"] = side
         args["rowId"] = String(span.rowId)
+        args["duration_ms"] = String(format: "%.3f", span.durationMs)
+        // Chrome trace `ts`/`dur` are microseconds; our spans are recorded in ms.
+        let tsUs = (span.startMs - origin) * 1000
+        let durUs = span.durationMs * 1000
         return ChromeTraceEvent(
             name: span.phase,
             cat: span.rowKind,
             ph: "X",
-            ts: span.startMs - origin,
-            dur: span.durationMs,
+            ts: tsUs,
+            dur: durUs,
             pid: pid,
             tid: rowThreadId(kind: span.rowKind, rowId: span.rowId),
             args: args)
