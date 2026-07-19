@@ -64,8 +64,12 @@ final class PhoneReceiver: ObservableObject {
     @Published var peerSignal: PeerUpdateSignal?
 
     private var listener: NWListener?
+    private var traceListener: NWListener?
     private var listenerHealthy = false
+    private var traceListenerHealthy = false
     private var connection: NWConnection?
+    private var traceConnection: NWConnection?
+    private var pendingTraceMessages: [[String: Any]] = []
     private let queue = DispatchQueue(label: "receiver.video")
     private static let queueKey = DispatchSpecificKey<UInt8>()
     private var buffer = Data()
@@ -77,7 +81,8 @@ final class PhoneReceiver: ObservableObject {
     // for 5s the connection is half-open (Mac killed, tunnel died) — drop it
     // so the listener can accept a fresh one.
     private var lastDataReceived = Date()
-    private var port: UInt16 = 9000
+    private var port: UInt16 = WireProtocol.defaultControlPort
+    private var tracePort: UInt16 = WireProtocol.tracePort(controlPort: WireProtocol.defaultControlPort)
     private var monitorsStarted = false
 
     private var framesThisWindow = 0
@@ -236,9 +241,13 @@ final class PhoneReceiver: ObservableObject {
         queue.setSpecific(key: Self.queueKey, value: 1)
     }
 
-    func start(port: UInt16 = 9000) {
+    func start(port: UInt16 = WireProtocol.defaultControlPort) {
         self.port = port
-        queue.async { self.startListener() }
+        self.tracePort = WireProtocol.tracePort(controlPort: port)
+        queue.async {
+            self.startListener()
+            self.startTraceListener()
+        }
         if !monitorsStarted {
             monitorsStarted = true
             schedulePing()
@@ -250,9 +259,13 @@ final class PhoneReceiver: ObservableObject {
     /// returns to the foreground (iOS may have torn it down while suspended).
     func ensureListening() {
         queue.async {
-            guard !self.listenerHealthy else { return }
-            Log.info("listener not healthy — restarting")
-            self.restartListener()
+            if !self.listenerHealthy {
+                Log.info("listener not healthy — restarting")
+                self.restartListener()
+            } else if !self.traceListenerHealthy {
+                Log.info("trace listener not healthy — restarting")
+                self.startTraceListener()
+            }
         }
     }
 
@@ -260,7 +273,14 @@ final class PhoneReceiver: ObservableObject {
         listener?.cancel()
         listener = nil
         listenerHealthy = false
+        traceListener?.cancel()
+        traceListener = nil
+        traceListenerHealthy = false
+        traceConnection?.cancel()
+        traceConnection = nil
+        pendingTraceMessages.removeAll(keepingCapacity: true)
         startListener()
+        startTraceListener()
     }
 
     private func startListener() {
@@ -324,6 +344,60 @@ final class PhoneReceiver: ObservableObject {
             }
         }
         listener?.start(queue: queue)
+    }
+
+    /// Trace-only TCP (controlPort + 1). Pencil stays on the main connection.
+    private func startTraceListener() {
+        do {
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            params.serviceClass = .background
+            traceListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: tracePort)!)
+        } catch {
+            Log.info("trace listener failed: \(error)")
+            return
+        }
+        traceListener?.newConnectionHandler = { [weak self] conn in
+            guard let self else { return }
+            Log.info("trace channel connection from \(String(describing: conn.endpoint))")
+            self.traceConnection?.cancel()
+            self.traceConnection = conn
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .failed, .cancelled:
+                    self.traceConnection = nil
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+            self.flushPendingTraceMessages()
+        }
+        traceListener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.traceListenerHealthy = true
+                Log.info("trace listener ready on :\(self.tracePort)")
+            case .failed(let error):
+                Log.info("trace listener failed: \(error)")
+                self.traceListenerHealthy = false
+                self.queue.asyncAfter(deadline: .now() + 1) { self.startTraceListener() }
+            case .cancelled:
+                self.traceListenerHealthy = false
+            default: break
+            }
+        }
+        traceListener?.start(queue: queue)
+    }
+
+    private func flushPendingTraceMessages() {
+        guard traceConnection != nil, !pendingTraceMessages.isEmpty else { return }
+        let pending = pendingTraceMessages
+        pendingTraceMessages.removeAll(keepingCapacity: true)
+        for msg in pending { sendTrace(msg) }
     }
 
     // MARK: - Liveness (ping + watchdog)
@@ -501,7 +575,7 @@ final class PhoneReceiver: ObservableObject {
         queue.async {
             if phase == .down {
                 IPadTrace.beginOnPenDown(clockOffsetMs: self.clockOffsetMs) { msg in
-                    self.sendControl(msg)
+                    self.sendTrace(msg)
                 }
             }
             let queueMs = self.nowMs
@@ -536,7 +610,7 @@ final class PhoneReceiver: ObservableObject {
                                       queueMs: queueMs, sendMs: self.nowMs)
             }
             if phase == .up {
-                IPadTrace.finishUpload { msg in self.sendControl(msg) }
+                IPadTrace.finishUpload { msg in self.sendTrace(msg) }
             }
         }
     }
@@ -608,6 +682,33 @@ final class PhoneReceiver: ObservableObject {
             pendingPenSamples[i].matched = true
         }
         pendingPenSamples.removeAll { $0.matched && displayDevMs - $0.devMs > 500 }
+    }
+
+    /// Trace payloads (traceStart/Span/End) — isolated TCP port, not the input channel.
+    func sendTrace(_ message: [String: Any], sent: (() -> Void)? = nil) {
+        let send = { [weak self] in
+            guard let self else { return }
+            guard let conn = self.traceConnection,
+                  let payload = try? JSONSerialization.data(withJSONObject: message) else {
+                if self.pendingTraceMessages.count < 64 {
+                    self.pendingTraceMessages.append(message)
+                }
+                sent?()
+                return
+            }
+            var header = UInt32(payload.count).bigEndian
+            var frame = Data(bytes: &header, count: 4)
+            frame.append(payload)
+            conn.send(content: frame, completion: .contentProcessed { error in
+                if let error { Log.info("trace send error: \(error)") }
+                sent?()
+            })
+        }
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            send()
+        } else {
+            queue.async(execute: send)
+        }
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,

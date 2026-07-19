@@ -8,7 +8,7 @@ enum IPadTrace {
     private static let lock = NSLock()
     private static var pendingSessionId: String?
     private static var awaitingUpload = false
-    private static var sendControl: ((_ msg: [String: Any]) -> Void)?
+    private static var sendTrace: ((_ msg: [String: Any]) -> Void)?
     private static var streamBuffer: [TraceSpan] = []
     private static var streamSeq = 0
     private static var clockOffsetMs: Double = 0
@@ -24,11 +24,11 @@ enum IPadTrace {
         sendMsByFrame.removeAll(keepingCapacity: true)
         streamBuffer.removeAll(keepingCapacity: true)
         streamSeq = 0
-        sendControl = nil
+        sendTrace = nil
     }
 
     /// Pen down → input trace until pen up — spans stream to Mac as they are recorded.
-    static func beginOnPenDown(clockOffsetMs: Double?, sendStart: @escaping (_ msg: [String: Any]) -> Void) {
+    static func beginOnPenDown(clockOffsetMs: Double?, sendTrace startTrace: @escaping (_ msg: [String: Any]) -> Void) {
         guard !TraceCollector.shared.isActive else { return }
         let sessionId = UUID().uuidString
         let now = Date().timeIntervalSince1970 * 1000
@@ -45,15 +45,15 @@ enum IPadTrace {
         awaitingUpload = true
         self.clockOffsetMs = offset
         resetSessionState()
-        sendControl = sendStart
+        sendTrace = startTrace
         lock.unlock()
         var msg = TraceWire.startMessage(sessionId: sessionId, mode: .input,
                                          maxFrames: 0, maxInputs: 0,
                                          tDev: now,
                                          tMac: TraceCollector.shared.ipadUnifiedMs(wallMs: now))
         msg["clockOffset"] = offset
-        sendStart(msg)
-        Log.info("[trace] iPad input session started id=\(sessionId.prefix(8)) — streaming spans to Mac")
+        startTrace(msg)
+        Log.info("[trace] iPad input session started id=\(sessionId.prefix(8)) — trace on dedicated port")
     }
 
     static func handleTraceStop(sessionId: String, upload: @escaping (_ msg: [String: Any]) -> Void) {
@@ -110,7 +110,7 @@ enum IPadTrace {
 
     private static func flushStreamBuffer(force: Bool = false) {
         lock.lock()
-        guard let sessionId = pendingSessionId, let send = sendControl else {
+        guard let sessionId = pendingSessionId, let send = sendTrace else {
             lock.unlock()
             return
         }
@@ -187,7 +187,7 @@ enum IPadTrace {
             return
         }
         awaitingUpload = false
-        sendControl = send
+        sendTrace = send
         lock.unlock()
 
         flushStreamBuffer(force: true)

@@ -103,9 +103,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
+    private var traceConnection: NWConnection?
+    private let traceQueue = DispatchQueue(label: "sender.trace", qos: .utility)
+    private var traceConnectionReady = false
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
     private let startCode: [UInt8] = [0, 0, 0, 1]
+
+    private var controlPort: UInt16 {
+        switch transport {
+        case .tcp(let endpoint):
+            if case .hostPort(_, let port) = endpoint { return port.rawValue }
+            return WireProtocol.defaultControlPort
+        case .usb(_, let port):
+            return port
+        }
+    }
+
+    private var tracePortNum: UInt16 { WireProtocol.tracePort(controlPort: controlPort) }
 
     // The dial target. Written on `queue` only (after init): the controller
     // can migrate a live session between transports via switchTransport.
@@ -483,6 +498,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.dialGeneration += 1   // a dial still in flight must not adopt
             self.connection?.cancel()
             self.connection = nil
+            self.traceConnection?.cancel()
+            self.traceConnection = nil
+            self.traceConnectionReady = false
             self.pendingSends = 0
             self.pipelineLock.lock()
             self.pendingEncodes = 0
@@ -557,6 +575,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastCursorSent = (-1, -1, false)
         lastReceived = Date()  // fresh grace period for the watchdog
         receiveControl(on: conn)
+        connectTracePort()
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
@@ -662,6 +681,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let generation = dialGeneration
         connection?.cancel()
         connection = nil
+        traceConnection?.cancel()
+        traceConnection = nil
+        traceConnectionReady = false
         pendingSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
@@ -806,6 +828,113 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { self.sendJSONFrame(msg) }
     }
 
+    // MARK: - Trace channel (port controlPort + 1, background queue)
+
+    private func connectTracePort() {
+        traceConnection?.cancel()
+        traceConnection = nil
+        traceConnectionReady = false
+
+        switch transport {
+        case .tcp(let endpoint):
+            guard case .hostPort(let host, _) = endpoint,
+                  let port = NWEndpoint.Port(rawValue: tracePortNum) else { return }
+            let traceEndpoint = NWEndpoint.hostPort(host: host, port: port)
+            let options = NWProtocolTCP.Options()
+            options.noDelay = true
+            let params = NWParameters(tls: nil, tcp: options)
+            let conn = NWConnection(to: traceEndpoint, using: params)
+            traceConnection = conn
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.traceConnectionReady = true
+                    self.receiveTrace(on: conn)
+                    Log.info("[trace] trace channel ready :\(self.tracePortNum)")
+                case .failed(let error):
+                    Log.info("[trace] trace channel failed: \(error)")
+                    self.traceConnectionReady = false
+                case .cancelled:
+                    self.traceConnectionReady = false
+                default: break
+                }
+            }
+            conn.start(queue: traceQueue)
+        case .usb(let udid, _):
+            let generation = dialGeneration
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let conn = try await Usbmux.dial(udid: udid, port: self.tracePortNum,
+                                                     queue: self.traceQueue)
+                    self.traceQueue.async {
+                        guard generation == self.dialGeneration, !self.stopped else {
+                            conn.cancel()
+                            return
+                        }
+                        self.traceConnection = conn
+                        self.traceConnectionReady = true
+                        self.receiveTrace(on: conn)
+                        Log.info("[trace] trace channel ready (USB :\(self.tracePortNum))")
+                    }
+                } catch {
+                    Log.info("[trace] trace channel dial failed: \(error)")
+                }
+            }
+        }
+    }
+
+    private func receiveTrace(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
+            guard let self, error == nil, let data, data.count == 4 else { return }
+            let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
+            guard len > 0, len < 4_000_000 else { return }
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
+                guard let self, error == nil, let payload, payload.count == len else { return }
+                self.handleTracePayload(payload)
+                self.receiveTrace(on: conn)
+            }
+        }
+    }
+
+    private func handleTracePayload(_ payload: Data) {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let type = obj["type"] as? String else {
+            Log.info("[trace] unparseable trace payload (\(payload.count) bytes)")
+            return
+        }
+        switch type {
+        case WireTrace.traceStart:
+            if let sessionId = obj["sessionId"] as? String {
+                let modeStr = obj["mode"] as? String ?? TraceMode.frame.rawValue
+                let mode = TraceMode(rawValue: modeStr) ?? .frame
+                let maxFrames = obj["maxFrames"] as? Int ?? 100
+                let maxInputs = obj["maxInputs"] as? Int ?? 0
+                let offset = obj["clockOffset"] as? Double ?? 0
+                MacTrace.handleTraceStart(sessionId: sessionId, mode: mode,
+                                          maxFrames: maxFrames, maxInputs: maxInputs,
+                                          clockOffsetMs: offset)
+            }
+        case WireTrace.traceSpan:
+            if let parsed = TraceWire.decodeSpanBatch(obj) {
+                MacTrace.handleTraceSpan(sessionId: parsed.sessionId, seq: parsed.seq,
+                                         spans: parsed.spans)
+            }
+        case WireTrace.traceEnd:
+            if let parsed = TraceWire.decodeEnd(obj) {
+                MacTrace.handleTraceEnd(sessionId: parsed.sessionId,
+                                        inputRows: parsed.inputRows, spanSeq: parsed.spanSeq)
+            }
+        case WireTrace.traceUpload:
+            if let parsed = TraceWire.decodeUpload(obj) {
+                MacTrace.handleTraceUpload(sessionId: parsed.sessionId, spans: parsed.spans)
+            }
+        default:
+            Log.info("[trace] unknown trace channel type: \(type)")
+        }
+    }
+
     // MARK: - Control messages (phone -> Mac)
 
     private func receiveControl(on conn: NWConnection) {
@@ -876,30 +1005,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         await self.reconfigure(info)
                     }
                 }
-            }
-        case WireTrace.traceStart:
-            if let sessionId = obj["sessionId"] as? String {
-                let modeStr = obj["mode"] as? String ?? TraceMode.frame.rawValue
-                let mode = TraceMode(rawValue: modeStr) ?? .frame
-                let maxFrames = obj["maxFrames"] as? Int ?? 100
-                let maxInputs = obj["maxInputs"] as? Int ?? 0
-                let offset = obj["clockOffset"] as? Double ?? 0
-                MacTrace.handleTraceStart(sessionId: sessionId, mode: mode,
-                                          maxFrames: maxFrames, maxInputs: maxInputs,
-                                          clockOffsetMs: offset)
-            }
-        case WireTrace.traceSpan:
-            if let parsed = TraceWire.decodeSpanBatch(obj) {
-                MacTrace.handleTraceSpan(sessionId: parsed.sessionId, seq: parsed.seq, spans: parsed.spans)
-            }
-        case WireTrace.traceEnd:
-            if let parsed = TraceWire.decodeEnd(obj) {
-                MacTrace.handleTraceEnd(sessionId: parsed.sessionId,
-                                          inputRows: parsed.inputRows, spanSeq: parsed.spanSeq)
-            }
-        case WireTrace.traceUpload:
-            if let parsed = TraceWire.decodeUpload(obj) {
-                MacTrace.handleTraceUpload(sessionId: parsed.sessionId, spans: parsed.spans)
             }
         case "touch", WireInput.pencil, WireInput.proximity,
              WireInput.gesture, WireInput.barrelButton, "scroll":

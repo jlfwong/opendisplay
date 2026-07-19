@@ -16,6 +16,8 @@ enum MacTrace {
     private static var finalizedSessions: Set<String> = []
     private static var finalizeWork: DispatchWorkItem?
     private static let finalizeQueue = DispatchQueue(label: "trace.finalize")
+    /// Ingest + disk export — never blocks the input/video queue.
+    private static let traceWorkQueue = DispatchQueue(label: "mac.trace.work", qos: .utility)
 
     static func handleTraceStart(sessionId: String, mode: TraceMode,
                                  maxFrames: Int, maxInputs: Int,
@@ -43,27 +45,35 @@ enum MacTrace {
 
     static func handleTraceSpan(sessionId: String, seq: Int, spans: [TraceSpan]) {
         guard !finalizedSessions.contains(sessionId) else { return }
-        let added = TraceCollector.shared.ingestIPadSpans(spans, seq: seq)
-        guard added > 0 else { return }
-        let now = Date().timeIntervalSince1970 * 1000
-        let session = TraceCollector.shared.buildPartialSession(endedAtMs: now)
-        guard session.sessionId == sessionId else {
-            Log.info("[trace] span batch session mismatch got=\(sessionId.prefix(8)) have=\(session.sessionId.prefix(8))")
-            return
-        }
-        if let url = TraceFileWriter.checkpointIfNeeded(session: session, ipadSpanCount: session.ipadSpans.count) {
-            Log.info("[trace] checkpoint \(session.ipadSpans.count) iPad spans → \(url.path)")
+        traceWorkQueue.async {
+            guard !finalizedSessions.contains(sessionId) else { return }
+            let added = TraceCollector.shared.ingestIPadSpans(spans, seq: seq)
+            guard added > 0 else { return }
+            let now = Date().timeIntervalSince1970 * 1000
+            let session = TraceCollector.shared.buildPartialSession(endedAtMs: now)
+            guard session.sessionId == sessionId else {
+                Log.info("[trace] span batch session mismatch got=\(sessionId.prefix(8)) have=\(session.sessionId.prefix(8))")
+                return
+            }
+            if let url = TraceFileWriter.checkpointIfNeeded(session: session,
+                                                            ipadSpanCount: session.ipadSpans.count) {
+                Log.info("[trace] checkpoint \(session.ipadSpans.count) iPad spans → \(url.path)")
+            }
         }
     }
 
     static func handleTraceEnd(sessionId: String, inputRows: Int, spanSeq: Int) {
-        finalize(sessionId: sessionId, reason: "traceEnd rows=\(inputRows) spanSeq=\(spanSeq)")
+        traceWorkQueue.async {
+            finalize(sessionId: sessionId, reason: "traceEnd rows=\(inputRows) spanSeq=\(spanSeq)")
+        }
     }
 
     /// Legacy bulk upload — still supported.
     static func handleTraceUpload(sessionId: String, spans: [TraceSpan]) {
-        _ = TraceCollector.shared.ingestIPadSpans(spans)
-        finalize(sessionId: sessionId, reason: "traceUpload \(spans.count) spans")
+        traceWorkQueue.async {
+            _ = TraceCollector.shared.ingestIPadSpans(spans)
+            finalize(sessionId: sessionId, reason: "traceUpload \(spans.count) spans")
+        }
     }
 
     static func pencilPhaseEnded(phase: String?) {
@@ -202,7 +212,9 @@ enum MacTrace {
         finalizeWork?.cancel()
         let sessionId = TraceCollector.shared.currentSessionId
         let work = DispatchWorkItem {
-            finalize(sessionId: sessionId, reason: reason)
+            traceWorkQueue.async {
+                finalize(sessionId: sessionId, reason: reason)
+            }
         }
         finalizeWork = work
         finalizeQueue.asyncAfter(deadline: .now() + 0.6, execute: work)
