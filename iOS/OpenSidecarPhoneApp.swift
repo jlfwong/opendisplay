@@ -43,6 +43,7 @@ struct ReceiverScreen: View {
     @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
     @AppStorage("hasConnectedBefore") private var hasConnectedBefore = false
@@ -78,9 +79,11 @@ struct ReceiverScreen: View {
                         .ignoresSafeArea()
                     VStack {
                         Spacer()
-                        PerfOverlay(stats: model.receiver.perf,
-                                    videoSize: model.receiver.videoSize)
-                            .padding(.bottom, 10)
+                        if showPerfOverlay {
+                            PerfOverlay(stats: model.receiver.perf,
+                                        videoSize: model.receiver.videoSize)
+                                .padding(.bottom, 10)
+                        }
                     }
                     .allowsHitTesting(false)
                 } else {
@@ -474,6 +477,7 @@ struct SettingsView: View {
     @ObservedObject var receiver: PhoneReceiver
     @Environment(\.dismiss) private var dismiss
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     @AppStorage(LatencyTelemetry.detailedLogKey) private var latencyLog = false
 
     private var version: String {
@@ -507,12 +511,13 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("Performance overlay", isOn: $showPerfOverlay)
                     Toggle("Metal renderer (experimental)", isOn: $metalRenderer)
                     Toggle("Latency detail log", isOn: $latencyLog)
                 } header: {
                     Text("Analytics")
                 } footer: {
-                    Text("Overlay: FPS, bitrate, latency breakdown. stroke = pen on glass → iPad display (target under 16 ms). input = pen → Mac; paint = inject → capture; latency = capture → display. Detail log writes [latency] lines to the device log.")
+                    Text("Overlay shows transport (USB/WiFi), FPS, bitrate, and latency breakdown. stroke = pen on glass → iPad display (target under 16 ms). input = pen → Mac; paint = inject → capture; latency = capture → display. Detail log writes [latency] lines to the device log.")
                 }
 
                 Section {
