@@ -845,6 +845,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
                 }
             }
+        case WireInput.key:
+            if let keyCode = obj["keyCode"] as? Int {
+                let down = (obj["down"] as? Bool) ?? false
+                inputInjector?.handleKey(keyCode: UInt16(keyCode), down: down)
+            }
+        case WireInput.shortcut:
+            if let action = obj["action"] as? String {
+                inputInjector?.handleShortcut(action: action)
+            }
         case "kf":
             // The phone's decoder lost sync (e.g. it attached mid-GOP and
             // periodic keyframes are off) — force an IDR on the next frame.

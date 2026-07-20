@@ -135,6 +135,10 @@ final class PhoneReceiver: ObservableObject {
     /// message so it can size the virtual display. Orientation-dependent:
     /// rotating the phone re-announces with swapped dimensions and the Mac
     /// rebuilds the virtual display as a portrait/landscape monitor.
+    /// Hello dimensions exclude the left sidebar strip (content area only).
+    static let sidebarWidthPoints: CGFloat = 72
+    private static let minContentPixelsWide = 512
+
     private var nativeLong = 0
     private var nativeShort = 0
     private(set) var devicePixelsWide = 0
@@ -187,19 +191,32 @@ final class PhoneReceiver: ObservableObject {
         nativeLong = long
         nativeShort = short
         deviceScale = scale
-        if devicePixelsWide == 0 {   // default landscape until the view reports
-            devicePixelsWide = long
-            devicePixelsHigh = short
+        if devicePixelsWide == 0 {
+            let content = contentPixels(portrait: false)
+            devicePixelsWide = content.wide
+            devicePixelsHigh = content.high
         }
     }
 
+    /// Content-area pixel dimensions for hello — panel minus the left sidebar.
+    func contentPixels(portrait: Bool) -> (wide: Int, high: Int) {
+        let panelW = portrait ? nativeShort : nativeLong
+        let panelH = portrait ? nativeLong : nativeShort
+        let sidebarPx = Int(Self.sidebarWidthPoints * deviceScale)
+        var contentW = panelW - sidebarPx
+        contentW = max(contentW, Self.minContentPixelsWide)
+        contentW &= ~1
+        return (contentW, panelH)
+    }
+
     func setOrientation(portrait: Bool) {
-        let w = portrait ? nativeShort : nativeLong
-        let h = portrait ? nativeLong : nativeShort
-        guard w > 0, w != devicePixelsWide else { return }
-        devicePixelsWide = w
-        devicePixelsHigh = h
-        Log.info("orientation changed -> \(portrait ? "portrait" : "landscape") \(w)x\(h)")
+        let content = contentPixels(portrait: portrait)
+        guard content.wide > 0,
+              content.wide != devicePixelsWide || content.high != devicePixelsHigh else { return }
+        devicePixelsWide = content.wide
+        devicePixelsHigh = content.high
+        Log.info("orientation changed -> \(portrait ? "portrait" : "landscape") "
+                 + "\(content.wide)x\(content.high) content (sidebar \(Int(Self.sidebarWidthPoints))pt)")
         if let connection { sendHello(on: connection) }
     }
 
@@ -464,6 +481,14 @@ final class PhoneReceiver: ObservableObject {
 
     func sendBarrelButton(down: Bool, x: Double, y: Double) {
         sendControl(["type": WireInput.barrelButton, "down": down, "x": x, "y": y])
+    }
+
+    func sendKey(keyCode: UInt16, down: Bool) {
+        sendControl(["type": WireInput.key, "keyCode": Int(keyCode), "down": down])
+    }
+
+    func sendUndo() {
+        sendControl(["type": WireInput.shortcut, "action": WireShortcut.undo])
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {

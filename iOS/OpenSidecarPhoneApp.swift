@@ -71,21 +71,34 @@ struct ReceiverScreen: View {
         GeometryReader { geo in
             ZStack {
                 if isStreaming {
-                    Color.black.ignoresSafeArea()
-                    VideoLayerView(displayLayer: model.receiver.displayLayer,
-                                   receiver: model.receiver,
-                                   useMetal: metalRenderer)
-                        .id(metalRenderer)
-                        .ignoresSafeArea()
-                    if showAnalytics {
-                        VStack {
-                            Spacer()
-                            PerfOverlay(stats: model.receiver.perf,
-                                        videoSize: model.receiver.videoSize)
-                                .padding(.bottom, 10)
+                    HStack(spacing: 0) {
+                        SidebarView(width: PhoneReceiver.sidebarWidthPoints,
+                                      onKey: { keyCode, down in
+                            if model.receiver.connected || !down {
+                                model.receiver.sendKey(keyCode: keyCode, down: down)
+                            }
+                        }, onUndo: {
+                            model.receiver.sendUndo()
+                        })
+                        ZStack {
+                            VideoLayerView(displayLayer: model.receiver.displayLayer,
+                                           receiver: model.receiver,
+                                           useMetal: metalRenderer)
+                                .id(metalRenderer)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            if showAnalytics {
+                                VStack {
+                                    Spacer()
+                                    PerfOverlay(stats: model.receiver.perf,
+                                                videoSize: model.receiver.videoSize)
+                                        .padding(.bottom, 10)
+                                }
+                                .allowsHitTesting(false)
+                            }
                         }
-                        .allowsHitTesting(false)
                     }
+                    .background(Color.black)
+                    .ignoresSafeArea()
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }

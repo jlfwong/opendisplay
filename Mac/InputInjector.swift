@@ -27,7 +27,7 @@ final class InputInjector {
     private let touchSink: InputInjectorTouchSink
 
     private let deviceID: Int64 = 1
-    /// Modifier flags from sidebar hold-keys — added in a follow-up PR.
+    /// Modifier flags from sidebar hold-keys applied to pointer events.
     private var heldModifiers: CGEventFlags = []
 
     init(displayID: CGDirectDisplayID) {
@@ -233,6 +233,20 @@ final class InputInjector {
     private func handleBarrelButton(down: Bool, x: Double?, y: Double?) {
         logState("barrelButton down=\(down) x=\(x ?? -1) y=\(y ?? -1)")
         postRightClick(down: down, x: x, y: y)
+    }
+
+    func handleKey(keyCode: UInt16, down: Bool) {
+        if down {
+            postKeyDown(keyCode: keyCode)
+        } else {
+            postKeyUp(keyCode: keyCode)
+        }
+    }
+
+    func handleShortcut(action: String) {
+        if action == WireShortcut.undo {
+            postKeyCommand(keyCode: 0x06, flags: .command)
+        }
     }
 
     // MARK: - CGEvent posting (gestures + scroll)

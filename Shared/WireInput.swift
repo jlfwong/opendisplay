@@ -14,6 +14,19 @@ enum WireInput {
     static let proximity = "proximity"
     static let barrelButton = "barrelButton"
     static let touches = "touches"
+    static let key = "key"
+    static let shortcut = "shortcut"
+}
+
+enum WireKeyCode {
+    static let command: UInt16 = 0x37
+    static let option: UInt16 = 0x3A
+    static let shift: UInt16 = 0x38
+    static let control: UInt16 = 0x3B
+}
+
+enum WireShortcut {
+    static let undo = "undo"
 }
 
 enum PencilPhase: String {
