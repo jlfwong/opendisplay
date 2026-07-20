@@ -22,6 +22,7 @@ final class InputInjector {
     private var pencilTapMode = false
 
     private let touchRecognizer: TouchGestureRecognizer
+    private let touchSink: InputInjectorTouchSink
 
     private let deviceID: Int64 = 1
 
@@ -35,6 +36,7 @@ final class InputInjector {
             fatalError("Could not create CGEventSource")
         }
         let sink = InputInjectorTouchSink()
+        self.touchSink = sink
         touchRecognizer = TouchGestureRecognizer(config: TouchGestureConfig(), sink: sink)
         sink.injector = self
     }
