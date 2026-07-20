@@ -1,11 +1,9 @@
 import SwiftUI
 
 /// Sidecar-style toolbar strip to the left of the streamed content.
-/// v1: modifier hold-keys plus Undo (matches Apple Sidecar's core shortcuts).
 struct SidebarView: View {
     let width: CGFloat
     var onKey: (UInt16, Bool) -> Void
-    var onUndo: () -> Void
 
     var body: some View {
         Color(white: 0.15)
@@ -22,11 +20,14 @@ struct SidebarView: View {
                     SidebarKeyButton(label: "⌃", accessibilityLabel: "Control") { down in
                         onKey(WireKeyCode.control, down)
                     }
-                    SidebarKeyButton(label: "⌘", accessibilityLabel: "Command") { down in
-                        onKey(WireKeyCode.command, down)
+                    SidebarKeyButton(label: "Z", accessibilityLabel: "Z") { down in
+                        onKey(WireKeyCode.z, down)
                     }
-                    SidebarActionButton(label: "↩", accessibilityLabel: "Undo") {
-                        onUndo()
+                    SidebarKeyButton(label: "R", accessibilityLabel: "R") { down in
+                        onKey(WireKeyCode.r, down)
+                    }
+                    SidebarKeyButton(label: "A", accessibilityLabel: "A") { down in
+                        onKey(WireKeyCode.a, down)
                     }
                 }
                 .padding(.horizontal, 8)
@@ -54,24 +55,5 @@ private struct SidebarKeyButton: View {
                 isPressing = pressing
                 onPress(pressing)
             }, perform: {})
-    }
-}
-
-private struct SidebarActionButton: View {
-    let label: String
-    let accessibilityLabel: String
-    var action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(label)
-                .font(.system(size: 22, weight: .medium, design: .rounded))
-                .foregroundStyle(.white.opacity(0.85))
-                .frame(maxWidth: .infinity)
-                .frame(height: 44)
-                .background(Color(white: 0.22), in: RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel)
     }
 }

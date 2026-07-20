@@ -42,9 +42,8 @@ struct ReceiverScreen: View {
     @State private var showOnboarding = false
     @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("showAnalytics") private var showAnalytics = false
-    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
     @AppStorage("hasConnectedBefore") private var hasConnectedBefore = false
@@ -73,29 +72,26 @@ struct ReceiverScreen: View {
             ZStack {
                 if isStreaming {
                     HStack(spacing: 0) {
-                        SidebarView(width: PhoneReceiver.sidebarWidthPoints,
-                                      onKey: { keyCode, down in
+                        SidebarView(width: PhoneReceiver.sidebarWidthPoints) { keyCode, down in
                             if model.receiver.connected || !down {
                                 model.receiver.sendKey(keyCode: keyCode, down: down)
                             }
-                        }, onUndo: {
-                            model.receiver.sendUndo()
-                        })
+                        }
                         ZStack {
                             VideoLayerView(displayLayer: model.receiver.displayLayer,
                                            receiver: model.receiver,
                                            useMetal: metalRenderer)
                                 .id(metalRenderer)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            if showAnalytics || showPerfOverlay {
-                                VStack {
-                                    Spacer()
+                            VStack {
+                                Spacer()
+                                if showPerfOverlay {
                                     PerfOverlay(stats: model.receiver.perf,
                                                 videoSize: model.receiver.videoSize)
                                         .padding(.bottom, 10)
                                 }
-                                .allowsHitTesting(false)
                             }
+                            .allowsHitTesting(false)
                         }
                     }
                     .background(Color.black)
@@ -338,6 +334,9 @@ struct PerfOverlay: View {
                     metric("stroke", String(format: "%.0f ms", stats.strokeP50))
                     metric("str p95", String(format: "%.0f ms", stats.strokeP95))
                 }
+                if stats.strokePhotonP50 > 0 {
+                    metric("stroke∅", String(format: "%.0f ms", stats.strokePhotonP50))
+                }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
                 metric("FPS", "\(stats.fps)")
                 if stats.capFps > 0 {
@@ -345,7 +344,8 @@ struct PerfOverlay: View {
                 }
                 metric("Mbit/s", String(format: "%.1f", stats.mbps))
                 metric("stalls", "\(stats.stalls)")
-                metric("drops", "\(stats.macDrops)")
+                metric("enc↓", "\(stats.macEncDrops)")
+                metric("net↓", "\(stats.macNetDrops)")
                 if stats.macPending > 0 {
                     metric("queue", "\(stats.macPending)")
                 }
@@ -486,9 +486,8 @@ struct BarGraph: View {
 struct SettingsView: View {
     @ObservedObject var receiver: PhoneReceiver
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("showAnalytics") private var showAnalytics = false
-    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     @AppStorage(LatencyTelemetry.detailedLogKey) private var latencyLog = false
 
     private var version: String {
@@ -523,13 +522,12 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Performance overlay", isOn: $showPerfOverlay)
-                    Toggle("Show legacy analytics overlay", isOn: $showAnalytics)
                     Toggle("Metal renderer (experimental)", isOn: $metalRenderer)
                     Toggle("Latency detail log", isOn: $latencyLog)
                 } header: {
                     Text("Analytics")
                 } footer: {
-                    Text("Overlay shows transport, FPS, input/paint/stroke latency, and graphs. stroke = pen on glass → iPad display. Detail log writes [latency] lines to the device log.")
+                    Text("Overlay shows transport (USB/WiFi), FPS, bitrate, and latency breakdown. stroke = pen on glass → iPad display (target under 16 ms). input = pen → Mac; paint = inject → capture; latency = capture → display. Detail log writes [latency] lines to the device log.")
                 }
 
                 Section {

@@ -31,16 +31,21 @@ struct PerfStats: Equatable {
     var rttMs = 0.0              // control-channel round trip
     var e2eSamples: [Double] = []  // last ~120 per-frame e2e latencies, ms
     var transport = "—"          // USB (loopback via usbmux) or WiFi
-    var macDrops = 0             // frames the Mac dropped (backpressure), total
+    var macEncDrops = 0          // Mac skipped capture: encoder busy (pending_encode)
+    var macNetDrops = 0          // Mac skipped capture: TCP queue full (pending_sends)
     var macPending = 0           // Mac send queue depth right now
     var inputP50 = 0.0           // touch sent → CGEvent injected on the Mac, ms
     var inputP95 = 0.0
-    var macPaintP50 = 0.0        // Mac inject → ScreenCaptureKit frame
-    var macPaintP95 = 0.0
-    var strokeP50 = 0.0          // pen on glass → iPad display
+    var capFps = 0               // frames ScreenCaptureKit delivered on the Mac
+    // Pen round-trip: Apple Pencil on glass → frame on the iPad.
+    var strokeP50 = 0.0
     var strokeP95 = 0.0
     var strokeSamples: [Double] = []
-    var capFps = 0               // frames ScreenCaptureKit delivered on the Mac
+    var macPaintP50 = 0.0        // Mac inject → ScreenCaptureKit frame
+    var macPaintP95 = 0.0
+    var strokePhotonP50 = 0.0    // pen → glass (Metal renderer only)
+    var strokePhotonP95 = 0.0
+    var strokePhotonSamples: [Double] = []
     // Metal renderer path only:
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
     var photonP50 = 0.0          // Mac capture → frame actually on glass, ms
@@ -59,9 +64,17 @@ final class PhoneReceiver: ObservableObject {
     @Published var peerSignal: PeerUpdateSignal?
 
     private var listener: NWListener?
+    private var traceListener: NWListener?
+    private var heartbeatListener: NWListener?
+    private var heartbeatConnection: NWConnection?
     private var listenerHealthy = false
+    private var traceListenerHealthy = false
+    private var heartbeatListenerHealthy = false
     private var connection: NWConnection?
-    private let queue = DispatchQueue(label: "receiver.video")
+    private var traceConnection: NWConnection?
+    private var pendingTraceMessages: [[String: Any]] = []
+    private let queue = DispatchQueue(label: "receiver.video", qos: .userInteractive)
+    private static let queueKey = DispatchSpecificKey<UInt8>()
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
     private var sps: Data?
@@ -71,7 +84,9 @@ final class PhoneReceiver: ObservableObject {
     // for 5s the connection is half-open (Mac killed, tunnel died) — drop it
     // so the listener can accept a fresh one.
     private var lastDataReceived = Date()
-    private var port: UInt16 = 9000
+    private var port: UInt16 = WireProtocol.defaultControlPort
+    private var tracePort: UInt16 = WireProtocol.tracePort(controlPort: WireProtocol.defaultControlPort)
+    private var heartbeatPort: UInt16 = WireProtocol.heartbeatPort(controlPort: WireProtocol.defaultControlPort)
     private var monitorsStarted = false
 
     private var framesThisWindow = 0
@@ -93,7 +108,8 @@ final class PhoneReceiver: ObservableObject {
     private var e2eRing: [Double] = []          // per-frame, for the overlay graph
     private var statsReportCounter = 0
     private var transport = "—"
-    private var macDrops = 0
+    private var macEncDrops = 0
+    private var macNetDrops = 0
     private var macPending = 0
     private var macInputP50 = 0.0
     private var macInputP95 = 0.0
@@ -109,7 +125,8 @@ final class PhoneReceiver: ObservableObject {
     private var pendingPenSamples: [PendingPenSample] = []
     private var strokeWindow: [Double] = []
     private var strokeRing: [Double] = []
-    private var inputIdCounter = 1
+    private var strokePhotonWindow: [Double] = []
+    private var strokePhotonRing: [Double] = []
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -143,8 +160,8 @@ final class PhoneReceiver: ObservableObject {
             if photon > -50, photon < 5000 {
                 self.photonWindow.append(max(photon, 0))
             }
-            self.recordStrokeLatencies(displayDevMs: presentedWallMs, captureMs: captureMs,
-                                       sendMs: nil, photon: true)
+            self.recordStrokeLatencies(displayDevMs: presentedWallMs,
+                                       captureMs: captureMs, sendMs: nil, photon: true)
         }
     }
 
@@ -210,7 +227,7 @@ final class PhoneReceiver: ObservableObject {
         nativeLong = long
         nativeShort = short
         deviceScale = scale
-        if devicePixelsWide == 0 {
+        if devicePixelsWide == 0 {   // default landscape until the view reports
             let content = contentPixels(portrait: false)
             devicePixelsWide = content.wide
             devicePixelsHigh = content.high
@@ -242,11 +259,18 @@ final class PhoneReceiver: ObservableObject {
     init(displayLayer: AVSampleBufferDisplayLayer) {
         self.displayLayer = displayLayer
         displayLayer.videoGravity = .resizeAspect
+        queue.setSpecific(key: Self.queueKey, value: 1)
     }
 
-    func start(port: UInt16 = 9000) {
+    func start(port: UInt16 = WireProtocol.defaultControlPort) {
         self.port = port
-        queue.async { self.startListener() }
+        self.tracePort = WireProtocol.tracePort(controlPort: port)
+        self.heartbeatPort = WireProtocol.heartbeatPort(controlPort: port)
+        queue.async {
+            self.startListener()
+            self.startTraceListener()
+            self.startHeartbeatListener()
+        }
         if !monitorsStarted {
             monitorsStarted = true
             schedulePing()
@@ -258,9 +282,16 @@ final class PhoneReceiver: ObservableObject {
     /// returns to the foreground (iOS may have torn it down while suspended).
     func ensureListening() {
         queue.async {
-            guard !self.listenerHealthy else { return }
-            Log.info("listener not healthy — restarting")
-            self.restartListener()
+            if !self.listenerHealthy {
+                Log.info("listener not healthy — restarting")
+                self.restartListener()
+            } else if !self.traceListenerHealthy {
+                Log.info("trace listener not healthy — restarting")
+                self.startTraceListener()
+            } else if !self.heartbeatListenerHealthy {
+                Log.info("heartbeat listener not healthy — restarting")
+                self.startHeartbeatListener()
+            }
         }
     }
 
@@ -268,7 +299,20 @@ final class PhoneReceiver: ObservableObject {
         listener?.cancel()
         listener = nil
         listenerHealthy = false
+        traceListener?.cancel()
+        traceListener = nil
+        traceListenerHealthy = false
+        traceConnection?.cancel()
+        traceConnection = nil
+        heartbeatConnection?.cancel()
+        heartbeatConnection = nil
+        heartbeatListener?.cancel()
+        heartbeatListener = nil
+        heartbeatListenerHealthy = false
+        pendingTraceMessages.removeAll(keepingCapacity: true)
         startListener()
+        startTraceListener()
+        startHeartbeatListener()
     }
 
     private func startListener() {
@@ -334,6 +378,129 @@ final class PhoneReceiver: ObservableObject {
         listener?.start(queue: queue)
     }
 
+    /// Trace-only TCP (controlPort + 1). Pencil stays on the main connection.
+    private func startTraceListener() {
+        do {
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            params.serviceClass = .background
+            traceListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: tracePort)!)
+        } catch {
+            Log.info("trace listener failed: \(error)")
+            return
+        }
+        traceListener?.newConnectionHandler = { [weak self] conn in
+            guard let self else { return }
+            Log.info("trace channel connection from \(String(describing: conn.endpoint))")
+            self.traceConnection?.cancel()
+            self.traceConnection = conn
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .failed, .cancelled:
+                    self.traceConnection = nil
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+            self.flushPendingTraceMessages()
+        }
+        traceListener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.traceListenerHealthy = true
+                Log.info("trace listener ready on :\(self.tracePort)")
+            case .failed(let error):
+                Log.info("trace listener failed: \(error)")
+                self.traceListenerHealthy = false
+                self.queue.asyncAfter(deadline: .now() + 1) { self.startTraceListener() }
+            case .cancelled:
+                self.traceListenerHealthy = false
+            default: break
+            }
+        }
+        traceListener?.start(queue: queue)
+    }
+
+    /// Heartbeat-only TCP (controlPort + 2) — tiny packets on an isolated usbmux connection.
+    private func startHeartbeatListener() {
+        do {
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            params.serviceClass = .interactiveVideo
+            heartbeatListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: heartbeatPort)!)
+        } catch {
+            Log.info("heartbeat listener failed: \(error)")
+            return
+        }
+        heartbeatListener?.newConnectionHandler = { [weak self] conn in
+            guard let self else { return }
+            Log.info("heartbeat channel connection from \(String(describing: conn.endpoint))")
+            self.heartbeatConnection?.cancel()
+            self.heartbeatConnection = conn
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.receiveHeartbeat(on: conn)
+                case .failed, .cancelled:
+                    if self.heartbeatConnection === conn { self.heartbeatConnection = nil }
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+        }
+        heartbeatListener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.heartbeatListenerHealthy = true
+                Log.info("heartbeat listener ready :\(self.heartbeatPort)")
+            case .failed(let error):
+                Log.info("heartbeat listener failed: \(error)")
+                self.heartbeatListenerHealthy = false
+            case .cancelled:
+                self.heartbeatListenerHealthy = false
+            default: break
+            }
+        }
+        heartbeatListener?.start(queue: queue)
+    }
+
+    private func receiveHeartbeat(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
+            guard let self, error == nil, let data, data.count == 4 else { return }
+            let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
+            guard len > 0, len < 1 << 16 else { return }
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
+                guard let self, error == nil, let payload, payload.count == len else { return }
+                self.handleHeartbeatJSON(payload, on: conn)
+                self.receiveHeartbeat(on: conn)
+            }
+        }
+    }
+
+    private func handleHeartbeatJSON(_ payload: Data, on conn: NWConnection) {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        if type == WireHeartbeat.ping, let t = obj["t"] as? Double {
+            let mt = nowMs
+            sendControl(["type": WireHeartbeat.pong, "t": t, "mt": mt], on: conn)
+        }
+    }
+
+    private func flushPendingTraceMessages() {
+        guard traceConnection != nil, !pendingTraceMessages.isEmpty else { return }
+        let pending = pendingTraceMessages
+        pendingTraceMessages.removeAll(keepingCapacity: true)
+        for msg in pending { sendTrace(msg) }
+    }
+
     // MARK: - Liveness (ping + watchdog)
 
     private func schedulePing() {
@@ -361,17 +528,27 @@ final class PhoneReceiver: ObservableObject {
             if offsetSamples.count > 15 { offsetSamples.removeFirst() }
             if let best = offsetSamples.min(by: { $0.rtt < $1.rtt }) {
                 clockOffsetMs = best.offset
+                IPadTrace.setClockOffset(best.offset)
             }
             lastRttMs = rtt
+            IPadTrace.recordPong(pingTDev: t1, pongTDev: t2, rttMs: rtt)
         case "ping":
             // The Mac piggybacks its send-side health on liveness pings.
-            macDrops = obj["drops"] as? Int ?? macDrops
+            if let enc = obj["encDrops"] as? Int {
+                macEncDrops = enc
+            } else if let drops = obj["drops"] as? Int {
+                // Pre-split Mac builds: all drops counted as encoder-side.
+                macEncDrops = drops
+            }
+            if let net = obj["netDrops"] as? Int {
+                macNetDrops = net
+            }
             macPending = obj["pending"] as? Int ?? macPending
             macInputP50 = obj["inp50"] as? Double ?? macInputP50
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
-            macCapFps = obj["capFps"] as? Int ?? macCapFps
             macPaintP50 = obj["paint50"] as? Double ?? macPaintP50
             macPaintP95 = obj["paint95"] as? Double ?? macPaintP95
+            macCapFps = obj["capFps"] as? Int ?? macCapFps
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -400,6 +577,12 @@ final class PhoneReceiver: ObservableObject {
                 ?? "Update OpenDisplay from the App Store to keep using your second display."
             let store = (obj["store"] as? String).flatMap { URL(string: $0) } ?? AppStore.updateURL
             DispatchQueue.main.async { self.peerSignal = .updateIPhone(message: message, storeURL: store) }
+        case WireTrace.traceStop:
+            if let sessionId = obj["sessionId"] as? String {
+                IPadTrace.handleTraceStop(sessionId: sessionId) { [weak self] msg in
+                    self?.sendControl(msg)
+                }
+            }
         default:
             break
         }
@@ -434,6 +617,11 @@ final class PhoneReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+        pendingPenSamples.removeAll(keepingCapacity: true)
+        strokeWindow.removeAll(keepingCapacity: true)
+        strokeRing.removeAll(keepingCapacity: true)
+        strokePhotonWindow.removeAll(keepingCapacity: true)
+        strokePhotonRing.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -451,8 +639,11 @@ final class PhoneReceiver: ObservableObject {
         Log.info("hello sent")
     }
 
+    /// Finger contact frames: normalized [0,1] in video space, origin top-left.
     func sendTouches(contacts: [WireTouchContact], osMs: Double, captureMs: Double) {
         guard !contacts.isEmpty else { return }
+        let devMs = nowMs
+        let macMs = clockOffsetMs.map { devMs + $0 }
         let contactDicts: [[String: Any]] = contacts.map { c in
             var d: [String: Any] = [
                 "id": c.id,
@@ -463,18 +654,29 @@ final class PhoneReceiver: ObservableObject {
             if let major = c.major { d["major"] = major }
             return d
         }
+        let wirePhase = wirePhase(for: contacts)
+        var msg: [String: Any] = [
+            "type": WireInput.touches,
+            "phase": wirePhase,
+            "contacts": contactDicts,
+            "tDev": devMs,
+        ]
+        if let macMs { msg["t"] = macMs }
         queue.async {
-            let devMs = self.nowMs
-            let macMs = self.clockOffsetMs.map { devMs + $0 }
-            let inpId = self.nextInputId()
-            var msg: [String: Any] = [
-                "type": WireInput.touches,
-                "phase": self.wirePhase(for: contacts),
-                "contacts": contactDicts,
-                "inpId": inpId,
-            ]
-            if let macMs { msg["t"] = macMs }
-            self.sendControl(msg, stampWire: true)
+            let queueMs = self.nowMs
+            var inpId: Int?
+            var traceThis = false
+            if self.shouldTraceInput(phase: wirePhase) {
+                inpId = IPadTrace.nextInputId()
+                traceThis = true
+                msg["inpId"] = inpId
+            }
+            self.sendControl(msg, stampWire: inpId != nil) {
+                guard traceThis, let inpId else { return }
+                IPadTrace.recordInput(inputId: inpId, phase: wirePhase,
+                                      osMs: osMs, captureMs: captureMs,
+                                      queueMs: queueMs, sendMs: self.nowMs)
+            }
         }
     }
 
@@ -490,9 +692,20 @@ final class PhoneReceiver: ObservableObject {
                     pressure: Double, azimuth: Double, altitude: Double,
                     rotation: Double, osMs: Double, captureMs: Double) {
         queue.async {
+            if phase == .down {
+                IPadTrace.beginOnPenDown(clockOffsetMs: self.clockOffsetMs) { msg in
+                    self.sendTrace(msg)
+                }
+            }
+            let queueMs = self.nowMs
             let devMs = self.nowMs
             let macMs = self.clockOffsetMs.map { devMs + $0 }
-            let inpId = self.nextInputId()
+            var inpId: Int?
+            var traceThis = false
+            if self.shouldTraceInput(phase: phase.rawValue) {
+                inpId = IPadTrace.nextInputId()
+                traceThis = true
+            }
             var msg: [String: Any] = [
                 "type": WireInput.pencil,
                 "phase": phase.rawValue,
@@ -501,21 +714,30 @@ final class PhoneReceiver: ObservableObject {
                 "azimuth": azimuth,
                 "altitude": altitude,
                 "rotation": rotation,
-                "inpId": inpId,
+                "tDev": devMs,
             ]
             if let macMs { msg["t"] = macMs }
+            if let inpId { msg["inpId"] = inpId }
             if phase != .hover, let macMs {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
             }
-            self.sendControl(msg, stampWire: true)
+            self.sendControl(msg, stampWire: inpId != nil) {
+                guard traceThis, let inpId else { return }
+                IPadTrace.recordInput(inputId: inpId, phase: phase.rawValue,
+                                      osMs: osMs, captureMs: captureMs,
+                                      queueMs: queueMs, sendMs: self.nowMs)
+            }
+            if phase == .up {
+                IPadTrace.finishUpload { msg in self.sendTrace(msg) }
+            }
         }
     }
 
-    private func nextInputId() -> Int {
-        let id = inputIdCounter
-        inputIdCounter += 1
-        return id
+    private func shouldTraceInput(phase: String) -> Bool {
+        guard TraceCollector.shared.tracesInput else { return false }
+        if phase == "hover" { return false }
+        return true
     }
 
     func sendProximity(entering: Bool, eraser: Bool) {
@@ -530,25 +752,7 @@ final class PhoneReceiver: ObservableObject {
         sendControl(["type": WireInput.key, "keyCode": Int(keyCode), "down": down])
     }
 
-    func sendUndo() {
-        sendControl(["type": WireInput.shortcut, "action": WireShortcut.undo])
-    }
-
-    private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
-                               stampWire: Bool = false) {
-        guard let conn = conn ?? connection,
-              let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
-        var header = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &header, count: 4)
-        frame.append(payload)
-        let inpId = message["inpId"] as? Int
-        conn.send(content: frame, completion: .contentProcessed { [weak self] error in
-            if let error { Log.info("control send error: \(error)") }
-            guard let self, stampWire, let inpId, let offset = self.clockOffsetMs else { return }
-            self.sendControl(["type": WireProtocol.inpSent, "inpId": inpId, "tSend": self.nowMs + offset])
-        })
-    }
-
+    /// Match each pen sample to the first frame captured on the Mac after it.
     private func recordStrokeLatencies(displayDevMs: Double, captureMs: Double,
                                        sendMs: Double?, photon: Bool) {
         guard clockOffsetMs != nil else { return }
@@ -557,16 +761,87 @@ final class PhoneReceiver: ObservableObject {
             guard captureMs >= pendingPenSamples[i].macMs else { continue }
             let lat = displayDevMs - pendingPenSamples[i].devMs
             if lat > 0, lat < 500 {
-                strokeWindow.append(lat)
-                strokeRing.append(lat)
-                if strokeRing.count > maxSamples { strokeRing.removeFirst() }
+                if photon {
+                    strokePhotonWindow.append(lat)
+                    strokePhotonRing.append(lat)
+                    if strokePhotonRing.count > maxSamples { strokePhotonRing.removeFirst() }
+                } else {
+                    strokeWindow.append(lat)
+                    strokeRing.append(lat)
+                    if strokeRing.count > maxSamples { strokeRing.removeFirst() }
+                }
                 if LatencyTelemetry.detailedLogEnabled {
-                    Log.info("\(LatencyTelemetry.logPrefix) stroke ms=\(String(format: "%.1f", lat))")
+                    var line = "\(LatencyTelemetry.logPrefix) stroke ms=\(String(format: "%.1f", lat))"
+                    line += " pen=\(Int(pendingPenSamples[i].devMs)) cap=\(Int(captureMs))"
+                    line += " disp=\(Int(displayDevMs)) photon=\(photon)"
+                    if let sendMs, let offset = clockOffsetMs {
+                        let sendDevMs = sendMs - offset
+                        line += " net=\(String(format: "%.1f", displayDevMs - sendDevMs))"
+                    }
+                    Log.info(line)
                 }
             }
             pendingPenSamples[i].matched = true
         }
         pendingPenSamples.removeAll { $0.matched && displayDevMs - $0.devMs > 500 }
+    }
+
+    /// Trace payloads (traceStart/Span/End) — isolated TCP port, not the input channel.
+    func sendTrace(_ message: [String: Any], sent: (() -> Void)? = nil) {
+        let send = { [weak self] in
+            guard let self else { return }
+            guard let conn = self.traceConnection,
+                  let payload = try? JSONSerialization.data(withJSONObject: message) else {
+                if self.pendingTraceMessages.count < 64 {
+                    self.pendingTraceMessages.append(message)
+                }
+                sent?()
+                return
+            }
+            var header = UInt32(payload.count).bigEndian
+            var frame = Data(bytes: &header, count: 4)
+            frame.append(payload)
+            conn.send(content: frame, completion: .contentProcessed { error in
+                if let error { Log.info("trace send error: \(error)") }
+                sent?()
+            })
+        }
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            send()
+        } else {
+            queue.async(execute: send)
+        }
+    }
+
+    private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
+                               stampWire: Bool = false,
+                               sent: (() -> Void)? = nil) {
+        let send = { [weak self] in
+            guard let self else { return }
+            guard let conn = conn ?? self.connection else { return }
+            var msg = message
+            if stampWire, let offset = self.clockOffsetMs {
+                msg["tHandoff"] = self.nowMs + offset
+            }
+            guard let payload = try? JSONSerialization.data(withJSONObject: msg) else { return }
+            var header = UInt32(payload.count).bigEndian
+            var frame = Data(bytes: &header, count: 4)
+            frame.append(payload)
+            let inpId = message["inpId"] as? Int
+            conn.send(content: frame, completion: .contentProcessed { error in
+                if let error { Log.info("control send error: \(error)") }
+                if stampWire, let inpId, let offset = self.clockOffsetMs {
+                    let tSend = self.nowMs + offset
+                    self.sendControl(["type": WireProtocol.inpSent, "inpId": inpId, "tSend": tSend])
+                }
+                sent?()
+            })
+        }
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            send()
+        } else {
+            queue.async(execute: send)
+        }
     }
 
     // MARK: - Socket read + length-prefixed deframing
@@ -647,10 +922,12 @@ final class PhoneReceiver: ObservableObject {
 
         var captureMs: Double?
         var sendMs: Double?
+        var frameId: Int?
         if let metaPrefix,
            let meta = try? JSONSerialization.jsonObject(with: metaPrefix) as? [String: Any] {
             captureMs = meta["cap"] as? Double
             sendMs = meta["snd"] as? Double
+            frameId = meta["fid"] as? Int
         }
 
         var vclNALUs: [Data] = []
@@ -676,8 +953,14 @@ final class PhoneReceiver: ObservableObject {
             buildFormatDescription(sps: sps, pps: pps)
         }
         guard !vclNALUs.isEmpty else { return }
+        if let frameId {
+            if let sendMs, let offset = clockOffsetMs {
+                IPadTrace.noteSendMs(frameId, sendMs: sendMs, clockOffsetMs: offset)
+            }
+            IPadTrace.frameRecvStarted(frameId)
+        }
         // All slices of one wire frame go into ONE sample buffer.
-        enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+        enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs, frameId: frameId)
     }
 
     private func buildFormatDescription(sps: Data, pps: Data) {
@@ -710,7 +993,8 @@ final class PhoneReceiver: ObservableObject {
         }
     }
 
-    private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil, sendMs: Double? = nil) {
+    private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil,
+                              sendMs: Double? = nil, frameId: Int? = nil) {
         guard let formatDesc else { return }
 
         // Build one AVCC buffer: each NALU prefixed with 4-byte big-endian length.
@@ -753,6 +1037,8 @@ final class PhoneReceiver: ObservableObject {
 
         guard let sample else { return }
 
+        if let frameId { IPadTrace.frameParseDone(frameId) }
+
         if loggedDisplayPath != (useMetalPath && onDecodedFrame != nil) {
             loggedDisplayPath = useMetalPath && onDecodedFrame != nil
             Log.info("display path: metal=\(useMetalPath) sink=\(onDecodedFrame != nil)")
@@ -777,6 +1063,8 @@ final class PhoneReceiver: ObservableObject {
             displayLayer.enqueue(sample)
         }
 
+        if let frameId { IPadTrace.frameDisplayed(frameId) }
+
         // Per-frame timing for the performance overlay.
         let now = Date()
         if let last = lastFrameAt {
@@ -799,6 +1087,8 @@ final class PhoneReceiver: ObservableObject {
                     if e2eRing.count > maxSamples { e2eRing.removeFirst() }
                 }
             }
+            recordStrokeLatencies(displayDevMs: nowMs, captureMs: captureMs,
+                                  sendMs: sendMs, photon: false)
         }
 
         framesThisWindow += 1
@@ -821,16 +1111,20 @@ final class PhoneReceiver: ObservableObject {
             stats.rttMs = lastRttMs
             stats.e2eSamples = e2eRing
             stats.transport = transport
-            stats.macDrops = macDrops
+            stats.macEncDrops = macEncDrops
+            stats.macNetDrops = macNetDrops
             stats.macPending = macPending
             stats.inputP50 = macInputP50
             stats.inputP95 = macInputP95
-            stats.macPaintP50 = macPaintP50
-            stats.macPaintP95 = macPaintP95
+            stats.capFps = macCapFps
             stats.strokeP50 = percentile(strokeWindow, 0.5)
             stats.strokeP95 = percentile(strokeWindow, 0.95)
             stats.strokeSamples = strokeRing
-            stats.capFps = macCapFps
+            stats.macPaintP50 = macPaintP50
+            stats.macPaintP95 = macPaintP95
+            stats.strokePhotonP50 = percentile(strokePhotonWindow, 0.5)
+            stats.strokePhotonP95 = percentile(strokePhotonWindow, 0.95)
+            stats.strokePhotonSamples = strokePhotonRing
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)
             stats.photonP95 = percentile(photonWindow, 0.95)
@@ -855,6 +1149,11 @@ final class PhoneReceiver: ObservableObject {
                     "rtt": lastRttMs.rounded(),
                     "stalls": stats.stalls,
                     "inp50": macInputP50.rounded(),
+                    "paint50": macPaintP50.rounded(),
+                    "paint95": macPaintP95.rounded(),
+                    "str50": stats.strokeP50.rounded(),
+                    "str95": stats.strokeP95.rounded(),
+                    "strPh50": stats.strokePhotonP50.rounded(),
                     "capFps": macCapFps,
                     "dec50": stats.decodeP50.rounded(),
                     "ph50": stats.photonP50.rounded(),
@@ -865,6 +1164,8 @@ final class PhoneReceiver: ObservableObject {
                 encodeWindow.removeAll(keepingCapacity: true)
                 decodeWindow.removeAll(keepingCapacity: true)
                 photonWindow.removeAll(keepingCapacity: true)
+                strokeWindow.removeAll(keepingCapacity: true)
+                strokePhotonWindow.removeAll(keepingCapacity: true)
             }
 
             DispatchQueue.main.async {

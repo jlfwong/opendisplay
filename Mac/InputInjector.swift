@@ -27,7 +27,7 @@ final class InputInjector {
     private let touchSink: InputInjectorTouchSink
 
     private let deviceID: Int64 = 1
-    /// Modifier flags from sidebar hold-keys applied to pointer events.
+    /// Modifier flags from sidebar hold-keys (Option, etc.) applied to pointer events.
     private var heldModifiers: CGEventFlags = []
 
     init(displayID: CGDirectDisplayID) {
@@ -73,6 +73,16 @@ final class InputInjector {
                 handleBarrelButton(down: down,
                                    x: obj["x"] as? Double,
                                    y: obj["y"] as? Double)
+            }
+        case WireInput.key:
+            if let keyCode = obj["keyCode"] as? Int {
+                let down = (obj["down"] as? Bool) ?? ((obj["down"] as? Int).map { $0 != 0 } ?? false)
+                if down {
+                    postKeyDown(keyCode: UInt16(keyCode))
+                } else {
+                    postKeyUp(keyCode: UInt16(keyCode))
+                }
+                markInjected()
             }
         default:
             break
@@ -235,20 +245,6 @@ final class InputInjector {
         postRightClick(down: down, x: x, y: y)
     }
 
-    func handleKey(keyCode: UInt16, down: Bool) {
-        if down {
-            postKeyDown(keyCode: keyCode)
-        } else {
-            postKeyUp(keyCode: keyCode)
-        }
-    }
-
-    func handleShortcut(action: String) {
-        if action == WireShortcut.undo {
-            postKeyCommand(keyCode: 0x06, flags: .command)
-        }
-    }
-
     // MARK: - CGEvent posting (gestures + scroll)
 
     private enum GestureEventField: Int {
@@ -396,7 +392,7 @@ final class InputInjector {
 
     private func modifierKeyMask(for keyCode: UInt16) -> CGEventFlags? {
         switch keyCode {
-        case 0x3A, 0x3D: return .maskAlternate
+        case WireKeyCode.option, 0x3D: return .maskAlternate
         case 0x38, 0x3C: return .maskShift
         case 0x37, 0x36: return .maskCommand
         case 0x3B, 0x3E: return .maskControl
@@ -482,6 +478,8 @@ final class InputInjector {
             Log.info("[input] recv proximity entering=\(obj["entering"] ?? "?") eraser=\(obj["eraser"] ?? "?") | \(stateLine())")
         case WireInput.barrelButton:
             Log.info("[input] recv barrelButton down=\(obj["down"] ?? "?") | \(stateLine())")
+        case WireInput.key:
+            Log.info("[input] recv key vk=\(obj["keyCode"] ?? "?") down=\(obj["down"] ?? "?") | \(stateLine())")
         default:
             break
         }

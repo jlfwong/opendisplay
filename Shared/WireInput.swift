@@ -15,18 +15,21 @@ enum WireInput {
     static let barrelButton = "barrelButton"
     static let touches = "touches"
     static let key = "key"
-    static let shortcut = "shortcut"
 }
 
 enum WireKeyCode {
-    static let command: UInt16 = 0x37
+    /// kVK_Option (left Option)
     static let option: UInt16 = 0x3A
+    /// kVK_Shift (left Shift)
     static let shift: UInt16 = 0x38
+    /// kVK_Control (left Control)
     static let control: UInt16 = 0x3B
-}
-
-enum WireShortcut {
-    static let undo = "undo"
+    /// kVK_ANSI_A
+    static let a: UInt16 = 0x00
+    /// kVK_ANSI_Z
+    static let z: UInt16 = 0x06
+    /// kVK_ANSI_R
+    static let r: UInt16 = 0x0F
 }
 
 enum PencilPhase: String {

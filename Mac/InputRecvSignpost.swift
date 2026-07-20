@@ -83,7 +83,7 @@ enum InputRecvSignpost {
 
     private static func isStrokePhase(type: String, phase: String?) -> Bool {
         switch type {
-        case "touch", WireInput.pencil:
+        case WireInput.pencil, WireInput.touches:
             guard let phase else { return true }
             return phase == "began" || phase == "moved"
                 || phase == "ended" || phase == "cancelled"
@@ -96,12 +96,12 @@ enum InputRecvSignpost {
 
     private static func countsForRecvGap(type: String, phase: String?) -> Bool {
         switch type {
-        case "touch", WireInput.pencil:
+        case WireInput.pencil:
             guard let phase else { return true }
             return phase != "hover"
         case WireInput.proximity:
             return false
-        case WireInput.barrelButton:
+        case WireInput.touches, WireInput.barrelButton:
             return true
         default:
             return false
