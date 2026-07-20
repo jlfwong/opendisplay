@@ -16,7 +16,7 @@ final class TouchGestureRecognizerTests: XCTestCase {
                 pinchDistanceThreshold: 1.5,
                 rotateMinSeparation: 80,
                 rotateAngleThreshold: 0.01,
-                singlePressDefer: 0.045
+                gestureSettleDefer: 0.045
             ),
             sink: sink
         )
@@ -238,6 +238,78 @@ final class TouchGestureRecognizerTests: XCTestCase {
         ], ts: 0.05)
 
         XCTAssertTrue(sink.effects.contains(.redo))
+        XCTAssertFalse(sink.effects.contains(.undo))
+    }
+
+    func testStaggeredThreeFingerTapEmitsRedoWithoutScroll() {
+        process(contacts: [contact(id: 1, phase: .began, x: 0.3, y: 0.5)], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.3, y: 0.5),
+            contact(id: 2, phase: .began, x: 0.5, y: 0.5),
+        ], ts: 0.02)
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.3, y: 0.5),
+            contact(id: 2, phase: .moved, x: 0.5, y: 0.5),
+            contact(id: 3, phase: .began, x: 0.7, y: 0.5),
+        ], ts: 0.04)
+        process(contacts: [
+            contact(id: 1, phase: .ended, x: 0.3, y: 0.5),
+            contact(id: 2, phase: .ended, x: 0.5, y: 0.5),
+            contact(id: 3, phase: .ended, x: 0.7, y: 0.5),
+        ], ts: 0.06)
+
+        XCTAssertTrue(sink.effects.contains(.redo))
+        XCTAssertFalse(sink.effects.contains(.undo))
+        XCTAssertFalse(sink.effects.contains { effect in
+            switch effect {
+            case .scroll, .magnify, .rotate:
+                return true
+            default:
+                return false
+            }
+        })
+    }
+
+    func testStaggeredThreeFingerViaTwoDoesNotManipulate() {
+        process(contacts: [contact(id: 1, phase: .began, x: 0.3, y: 0.5)], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.32, y: 0.52),
+            contact(id: 2, phase: .began, x: 0.5, y: 0.5),
+        ], ts: 0.02)
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.32, y: 0.52),
+            contact(id: 2, phase: .moved, x: 0.52, y: 0.52),
+            contact(id: 3, phase: .began, x: 0.7, y: 0.5),
+        ], ts: 0.04)
+
+        XCTAssertFalse(sink.effects.contains { effect in
+            switch effect {
+            case .scroll, .magnify, .rotate:
+                return true
+            default:
+                return false
+            }
+        })
+    }
+
+    func testTwoFingerPanStillWorksAfterSettle() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.4, y: 0.4),
+            contact(id: 2, phase: .began, x: 0.6, y: 0.4),
+        ], ts: 0)
+
+        sink.reset()
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.4, y: 0.5),
+            contact(id: 2, phase: .moved, x: 0.6, y: 0.5),
+        ], ts: 0.05)
+
+        XCTAssertTrue(sink.effects.contains { effect in
+            if case .scroll(_, _, let phase) = effect {
+                return phase == .began || phase == .changed
+            }
+            return false
+        })
         XCTAssertFalse(sink.effects.contains(.undo))
     }
 

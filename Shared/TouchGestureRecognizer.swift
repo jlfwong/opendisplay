@@ -79,9 +79,9 @@ struct TouchGestureConfig: Equatable {
     /// A two/three-finger touch that lifts within this window — without ever
     /// crossing a manipulation deadband — is a tap (undo / redo).
     var tapMaxDuration: TimeInterval = 0.35
-    /// Wait this long with only one finger down before committing mouse-down,
-    /// so a second finger landing shortly after does not draw a stroke.
-    var singlePressDefer: TimeInterval = 0.045
+    /// Shared settle window: defers single-finger mouse-down until stable, and
+    /// defers two-finger scroll/pinch until finger count stops increasing.
+    var gestureSettleDefer: TimeInterval = 0.045
 }
 
 // MARK: - Recognizer
@@ -135,6 +135,9 @@ final class TouchGestureRecognizer {
     private var interactionPeakFingers = 0
     private var interactionManipulated = false
     private var lastFingerCount = 0
+    /// Timestamp of the last finger-count increase; multi-touch manipulation waits
+    /// until gestureSettleDefer elapses with no further increases.
+    private var fingerCountStableSince: TimeInterval?
 
     init(config: TouchGestureConfig, sink: TouchGestureSink) {
         self.config = config
@@ -151,6 +154,7 @@ final class TouchGestureRecognizer {
         interactionPeakFingers = 0
         interactionManipulated = false
         lastFingerCount = 0
+        fingerCountStableSince = nil
         resetMultiGestureState(finalize: true)
     }
 
@@ -225,7 +229,7 @@ final class TouchGestureRecognizer {
             }
         case .multiTouch:
             if fingerCount >= 2 {
-                handleTwo(active, displayWidth: dw, displayHeight: dh, emit: emit)
+                handleTwo(active, displayWidth: dw, displayHeight: dh, now: now, emit: emit)
             } else if fingerCount == 1 {
                 handleRemainingFinger(active[0], emit: emit)
             }
@@ -262,12 +266,18 @@ final class TouchGestureRecognizer {
                                   now: TimeInterval,
                                   active: [TouchGestureContact],
                                   emit: (TouchGestureEffect) -> Void) {
+        if fingerCount > prevFingerCount {
+            fingerCountStableSince = now
+            if fingerCount >= 2 {
+                resetPairBaselines()
+            }
+        }
+
         if fingerCount >= 2 {
             if fingerMode == .singleDrawing {
                 retractSinglePress(emit: emit)
             }
             if fingerMode != .multiTouch {
-                resetPairBaselines()
                 warpToCentroid(active, emit: emit)
             }
             fingerMode = .multiTouch
@@ -330,6 +340,7 @@ final class TouchGestureRecognizer {
         emitTapIfNeeded(now: now, emit: emit)
         fingerMode = .idle
         singlePendingSince = nil
+        fingerCountStableSince = nil
         interactionStart = nil
         interactionPeakFingers = 0
         interactionManipulated = false
@@ -343,6 +354,7 @@ final class TouchGestureRecognizer {
         tracked.removeAll()
         fingerMode = .idle
         singlePendingSince = nil
+        fingerCountStableSince = nil
         resetMultiGestureState(finalize: false)
         interactionManipulated = false
     }
@@ -371,7 +383,7 @@ final class TouchGestureRecognizer {
                                         emit: (TouchGestureEffect) -> Void) {
         guard fingerMode == .singlePending,
               let since = singlePendingSince,
-              now - since >= config.singlePressDefer else { return }
+              now - since >= config.gestureSettleDefer else { return }
         emit(.pressLeft(x: x, y: y))
         leftDown = true
         fingerMode = .singleDrawing
@@ -408,6 +420,7 @@ final class TouchGestureRecognizer {
     private func handleTwo(_ contacts: [TouchGestureContact],
                            displayWidth: Double,
                            displayHeight: Double,
+                           now: TimeInterval,
                            emit: (TouchGestureEffect) -> Void) {
         guard contacts.count >= 2 else { return }
         let a = contacts[0]
@@ -423,11 +436,22 @@ final class TouchGestureRecognizer {
         let distance = hypot(ax - bx, ay - by)
         let angle = atan2(by - ay, bx - ax)
 
-        emit(.warpCursor(x: centroidX, y: centroidY))
+        if contacts.count >= 3 {
+            warpToCentroid(contacts, emit: emit)
+        } else {
+            emit(.warpCursor(x: centroidX, y: centroidY))
+        }
 
         if pairStartCentroid == nil { pairStartCentroid = (centroidX, centroidY) }
         if pairStartDistance == nil { pairStartDistance = distance }
         if pairStartAngle == nil { pairStartAngle = angle }
+
+        guard multiTouchManipulationAllowed(fingerCount: contacts.count, now: now) else {
+            prevPairDistance = distance
+            prevPairAngle = angle
+            scrollPrevCentroid = (centroidX, centroidY)
+            return
+        }
 
         let startCentroid = pairStartCentroid ?? (centroidX, centroidY)
         let travel = hypot((centroidX - startCentroid.x) * displayWidth,
@@ -576,6 +600,14 @@ final class TouchGestureRecognizer {
         let cx = active.reduce(0.0) { $0 + $1.x } / Double(active.count)
         let cy = active.reduce(0.0) { $0 + $1.y } / Double(active.count)
         emit(.warpCursor(x: cx, y: cy))
+    }
+
+    private func multiTouchManipulationAllowed(fingerCount: Int, now: TimeInterval) -> Bool {
+        guard fingerCount == 2,
+              interactionPeakFingers < 3,
+              let since = fingerCountStableSince,
+              now - since >= config.gestureSettleDefer else { return false }
+        return true
     }
 
     private func emitTapIfNeeded(now: TimeInterval, emit: (TouchGestureEffect) -> Void) {
