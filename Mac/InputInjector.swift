@@ -220,7 +220,11 @@ final class InputInjector {
         case .warpCursor(let x, let y):
             let p = screenPoint(nx: x, ny: y)
             lastGesturePoint = p
-            postMouse(type: .mouseMoved, at: p, button: .left)
+            if touchLeftDown {
+                CGWarpMouseCursorPosition(p)
+            } else {
+                postMouse(type: .mouseMoved, at: p, button: .left)
+            }
         case .magnify(let amount, let phase):
             postMagnify(amount: amount, phase: phase)
         case .rotate(let degrees, let phase):

@@ -15,7 +15,8 @@ final class TouchGestureRecognizerTests: XCTestCase {
                 scrollGain: 2.8,
                 pinchDistanceThreshold: 1.5,
                 rotateMinSeparation: 80,
-                rotateAngleThreshold: 0.01
+                rotateAngleThreshold: 0.01,
+                singlePressDefer: 0.045
             ),
             sink: sink
         )
@@ -37,7 +38,9 @@ final class TouchGestureRecognizerTests: XCTestCase {
         ], ts: 0.10)
 
         XCTAssertEqual(sink.effects, [
-            .pressLeft(x: 0.3, y: 0.4),
+            .warpCursor(x: 0.3, y: 0.4),
+            .warpCursor(x: 0.35, y: 0.45),
+            .pressLeft(x: 0.35, y: 0.45),
             .dragLeft(x: 0.35, y: 0.45),
             .releaseLeft(x: 0.35, y: 0.45),
         ])
@@ -45,17 +48,62 @@ final class TouchGestureRecognizerTests: XCTestCase {
 
     func testSingleFingerTapIsPressAndRelease() {
         process(contacts: [contact(id: 1, phase: .began, x: 0.5, y: 0.5)], ts: 0)
-        process(contacts: [contact(id: 1, phase: .ended, x: 0.5, y: 0.5)], ts: 0.05)
+        process(contacts: [contact(id: 1, phase: .ended, x: 0.5, y: 0.5)], ts: 0.02)
 
         XCTAssertEqual(sink.effects, [
+            .warpCursor(x: 0.5, y: 0.5),
             .pressLeft(x: 0.5, y: 0.5),
             .releaseLeft(x: 0.5, y: 0.5),
         ])
     }
 
+    func testDeferredSinglePressCommitsAfterDeferWindow() {
+        process(contacts: [contact(id: 1, phase: .began, x: 0.2, y: 0.3)], ts: 0)
+        sink.reset()
+
+        // Still within defer — warp only.
+        process(contacts: [contact(id: 1, phase: .moved, x: 0.21, y: 0.31)], ts: 0.02)
+        XCTAssertFalse(sink.effects.contains { effect in
+            if case .pressLeft = effect { return true }
+            return false
+        })
+        XCTAssertTrue(sink.effects.contains(.warpCursor(x: 0.21, y: 0.31)))
+
+        sink.reset()
+        // Past defer — press commits at current position.
+        process(contacts: [contact(id: 1, phase: .moved, x: 0.22, y: 0.32)], ts: 0.05)
+        XCTAssertTrue(sink.effects.contains(.pressLeft(x: 0.22, y: 0.32)))
+    }
+
     // MARK: - 1 → 2 finger transition
 
-    func testSecondFingerRetractsFirstPress() {
+    func testStaggeredTwoFingerWithinDeferDoesNotDraw() {
+        process(contacts: [contact(id: 1, phase: .began, x: 0.2, y: 0.3)], ts: 0)
+        process(contacts: [contact(id: 1, phase: .moved, x: 0.22, y: 0.32)], ts: 0.02)
+
+        sink.reset()
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.22, y: 0.32),
+            contact(id: 2, phase: .began, x: 0.5, y: 0.5),
+        ], ts: 0.03)
+
+        XCTAssertFalse(sink.effects.contains { effect in
+            switch effect {
+            case .pressLeft, .dragLeft, .releaseLeft:
+                return true
+            default:
+                return false
+            }
+        })
+        XCTAssertTrue(sink.effects.contains { effect in
+            if case .warpCursor(let x, let y) = effect {
+                return abs(x - 0.36) < 0.001 && abs(y - 0.41) < 0.001
+            }
+            return false
+        })
+    }
+
+    func testSecondFingerRetractsFirstPressAfterDefer() {
         process(contacts: [contact(id: 1, phase: .began, x: 0.2, y: 0.3)], ts: 0)
         process(contacts: [contact(id: 1, phase: .moved, x: 0.22, y: 0.32)], ts: 0.05)
 
@@ -77,14 +125,12 @@ final class TouchGestureRecognizerTests: XCTestCase {
     // MARK: - Two-finger scroll
 
     func testTwoFingerScrollEmitsPhasedScroll() {
-        // Start with two fingers down.
         process(contacts: [
             contact(id: 1, phase: .began, x: 0.4, y: 0.4),
             contact(id: 2, phase: .began, x: 0.6, y: 0.4),
         ], ts: 0)
 
         sink.reset()
-        // Move centroid down (increase y) — should scroll.
         process(contacts: [
             contact(id: 1, phase: .moved, x: 0.4, y: 0.5),
             contact(id: 2, phase: .moved, x: 0.6, y: 0.5),
@@ -219,8 +265,6 @@ final class TouchGestureRecognizerTests: XCTestCase {
         XCTAssertFalse(sink.effects.contains(.undo))
     }
 
-    // A fresh single-finger tap must work even after a multi-finger gesture
-    // left recognizer state behind (regression: single tap only warped cursor).
     func testSingleFingerTapWorksAfterTwoFingerGesture() {
         process(contacts: [
             contact(id: 1, phase: .began, x: 0.4, y: 0.4),
@@ -237,9 +281,10 @@ final class TouchGestureRecognizerTests: XCTestCase {
 
         sink.reset()
         process(contacts: [contact(id: 3, phase: .began, x: 0.5, y: 0.5)], ts: 1.0)
-        process(contacts: [contact(id: 3, phase: .ended, x: 0.5, y: 0.5)], ts: 1.05)
+        process(contacts: [contact(id: 3, phase: .ended, x: 0.5, y: 0.5)], ts: 1.02)
 
         XCTAssertEqual(sink.effects, [
+            .warpCursor(x: 0.5, y: 0.5),
             .pressLeft(x: 0.5, y: 0.5),
             .releaseLeft(x: 0.5, y: 0.5),
         ])

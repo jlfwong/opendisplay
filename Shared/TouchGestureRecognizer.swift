@@ -79,6 +79,9 @@ struct TouchGestureConfig: Equatable {
     /// A two/three-finger touch that lifts within this window — without ever
     /// crossing a manipulation deadband — is a tap (undo / redo).
     var tapMaxDuration: TimeInterval = 0.35
+    /// Wait this long with only one finger down before committing mouse-down,
+    /// so a second finger landing shortly after does not draw a stroke.
+    var singlePressDefer: TimeInterval = 0.045
 }
 
 // MARK: - Recognizer
@@ -94,6 +97,17 @@ final class TouchGestureRecognizer {
         var lastY: Double
     }
 
+    /// High-level finger routing — decide mode first, then emit effects.
+    private enum FingerMode {
+        case idle
+        /// One finger down; defer window — warp only, no mouse down yet.
+        case singlePending
+        /// One finger confirmed — press / drag / release.
+        case singleDrawing
+        /// Two or more fingers — gestures only, never mouse down.
+        case multiTouch
+    }
+
     private enum ActiveGesture {
         case pinch, rotate, scroll
     }
@@ -101,8 +115,9 @@ final class TouchGestureRecognizer {
     private var tracked: [Int: TrackedTouch] = [:]
     private var lastTimestamp: TimeInterval?
 
+    private var fingerMode: FingerMode = .idle
+    private var singlePendingSince: TimeInterval?
     private var leftDown = false
-    private var suppressSinglePress = false
 
     private var prevPairDistance: Double?
     private var prevPairAngle: Double?
@@ -112,17 +127,13 @@ final class TouchGestureRecognizer {
     private var scrollPhaseActive = false
     private var lockedGesture: ActiveGesture?
 
-    // Reference values captured when the current finger pair is first seen —
-    // used to measure cumulative travel against the deadbands.
     private var pairStartCentroid: (x: Double, y: Double)?
     private var pairStartDistance: Double?
     private var pairStartAngle: Double?
 
-    // Whole-interaction (first finger down → last finger up) tracking for taps.
     private var interactionStart: TimeInterval?
     private var interactionPeakFingers = 0
     private var interactionManipulated = false
-    /// Finger count at end of the previous frame (for 1→2 transition detection).
     private var lastFingerCount = 0
 
     init(config: TouchGestureConfig, sink: TouchGestureSink) {
@@ -133,8 +144,9 @@ final class TouchGestureRecognizer {
     func reset() {
         tracked.removeAll()
         lastTimestamp = nil
+        fingerMode = .idle
+        singlePendingSince = nil
         leftDown = false
-        suppressSinglePress = false
         interactionStart = nil
         interactionPeakFingers = 0
         interactionManipulated = false
@@ -158,14 +170,10 @@ final class TouchGestureRecognizer {
             emitted = true
         }
 
-        let prevActiveCount = lastFingerCount
+        let prevFingerCount = lastFingerCount
 
-        // A new `.began` for an id we weren't tracking means a fresh touch
-        // sequence — purge stale contacts that would otherwise make this look
-        // like a two-finger gesture (the #1 cause of single-finger taps doing
-        // nothing: pressLeft never fires, only warpCursor / scroll / magnify).
-        // Do NOT purge when a second finger joins an active touch: the existing
-        // tracked id(s) are still present in this frame.
+        // Unrelated `.began` while other ids are tracked → stale ghost contacts.
+        // Reset to idle (release if mid-stroke).
         for contact in frame.contacts where contact.phase == .began {
             guard tracked[contact.id] == nil, !tracked.isEmpty else { continue }
             let liveFrameIds = Set(
@@ -176,21 +184,10 @@ final class TouchGestureRecognizer {
             if tracked.keys.contains(where: { liveFrameIds.contains($0) }) {
                 continue
             }
-            if leftDown, let t = tracked.values.first {
-                emit(.releaseLeft(x: t.lastX, y: t.lastY))
-            }
-            leftDown = false
-            tracked.removeAll()
-            suppressSinglePress = false
-            resetMultiGestureState(finalize: false)
-            interactionManipulated = false
+            resetToIdle(emit: emit)
         }
 
-        // Start of a fresh touch sequence: clear any state a previous (possibly
-        // messy) interaction left behind, so a plain single-finger tap always
-        // begins clean instead of inheriting a stuck `suppressSinglePress`.
-        if prevActiveCount == 0 && frame.contacts.contains(where: { $0.phase == .began }) {
-            suppressSinglePress = false
+        if prevFingerCount == 0 && frame.contacts.contains(where: { $0.phase == .began }) {
             resetMultiGestureState(finalize: false)
             interactionStart = now
             interactionPeakFingers = 0
@@ -205,44 +202,33 @@ final class TouchGestureRecognizer {
         let fingerCount = active.count
         interactionPeakFingers = max(interactionPeakFingers, fingerCount)
 
-        if prevActiveCount == 1 && fingerCount >= 2 {
-            retractSinglePress(emit: emit)
-            suppressSinglePress = true
-            // Second finger landing inflates cumulative separation vs travel;
-            // reset pair baselines so pan/pinch lock reflects movement, not pose.
-            resetPairBaselines()
-            let cx = active.reduce(0.0) { $0 + $1.x } / Double(active.count)
-            let cy = active.reduce(0.0) { $0 + $1.y } / Double(active.count)
-            emit(.warpCursor(x: cx, y: cy))
-        }
+        handleSingleFingerEnded(in: frame.contacts, emit: emit)
 
-        switch fingerCount {
-        case 0:
-            finalizeMultiGesture(emit: emit)
-            if leftDown {
-                let x = tracked.values.first?.lastX ?? 0.5
-                let y = tracked.values.first?.lastY ?? 0.5
-                emit(.releaseLeft(x: x, y: y))
-                leftDown = false
+        updateFingerMode(
+            fingerCount: fingerCount,
+            prevFingerCount: prevFingerCount,
+            now: now,
+            active: active,
+            emit: emit
+        )
+
+        switch fingerMode {
+        case .idle:
+            break
+        case .singlePending:
+            if fingerCount == 1 {
+                handleSinglePending(active[0], now: now, emit: emit)
             }
-            emitTapIfNeeded(now: now, emit: emit)
-            suppressSinglePress = false
-            interactionStart = nil
-            interactionPeakFingers = 0
-            interactionManipulated = false
-        case 1:
-            handleSingle(active[0], displayWidth: dw, displayHeight: dh, emit: emit)
-            if fingerCount < prevActiveCount {
-                finalizeMultiGesture(emit: emit)
-                suppressSinglePress = true
-            } else {
-                resetMultiGestureState(finalize: false)
+        case .singleDrawing:
+            if fingerCount == 1 {
+                handleSingleDrawing(active[0], emit: emit)
             }
-        case 2:
-            handleTwo(active, displayWidth: dw, displayHeight: dh, emit: emit)
-        default:
-            finalizeMultiGesture(emit: emit)
-            suppressSinglePress = true
+        case .multiTouch:
+            if fingerCount >= 2 {
+                handleTwo(active, displayWidth: dw, displayHeight: dh, emit: emit)
+            } else if fingerCount == 1 {
+                handleRemainingFinger(active[0], emit: emit)
+            }
         }
 
         for contact in frame.contacts where contact.phase == .moved || contact.phase == .began || contact.phase == .ended {
@@ -260,28 +246,146 @@ final class TouchGestureRecognizer {
             tracked.removeValue(forKey: contact.id)
         }
 
+        if fingerCount == 0 && fingerMode != .idle {
+            finalizeInteractionEnd(now: now, contacts: frame.contacts, emit: emit)
+        }
+
         lastFingerCount = activeContacts(from: frame.contacts).count
 
         return emitted
     }
 
-    // MARK: - Single finger (direct touch)
+    // MARK: - Mode transitions
 
-    private func handleSingle(_ contact: TouchGestureContact,
-                              displayWidth: Double,
-                              displayHeight: Double,
-                              emit: (TouchGestureEffect) -> Void) {
+    private func updateFingerMode(fingerCount: Int,
+                                  prevFingerCount: Int,
+                                  now: TimeInterval,
+                                  active: [TouchGestureContact],
+                                  emit: (TouchGestureEffect) -> Void) {
+        if fingerCount >= 2 {
+            if fingerMode == .singleDrawing {
+                retractSinglePress(emit: emit)
+            }
+            if fingerMode != .multiTouch {
+                resetPairBaselines()
+                warpToCentroid(active, emit: emit)
+            }
+            fingerMode = .multiTouch
+            singlePendingSince = nil
+            return
+        }
+
+        if fingerCount == 0 {
+            return
+        }
+
+        if fingerCount == 1 && prevFingerCount == 0 {
+            fingerMode = .singlePending
+            singlePendingSince = now
+            return
+        }
+
+        if fingerCount == 1 && prevFingerCount >= 2 {
+            // 2→1: remain in multiTouch; remaining finger warps only.
+            fingerMode = .multiTouch
+            singlePendingSince = nil
+        }
+    }
+
+    private func handleSingleFingerEnded(in contacts: [TouchGestureContact],
+                                         emit: (TouchGestureEffect) -> Void) {
+        guard let ended = contacts.first(where: { $0.phase == .ended || $0.phase == .cancelled }),
+              contacts.filter({ $0.phase != .ended && $0.phase != .cancelled }).count <= 1 else {
+            return
+        }
+
+        switch fingerMode {
+        case .singlePending:
+            emit(.pressLeft(x: ended.x, y: ended.y))
+            emit(.releaseLeft(x: ended.x, y: ended.y))
+            fingerMode = .idle
+            singlePendingSince = nil
+        case .singleDrawing:
+            if leftDown {
+                emit(.releaseLeft(x: ended.x, y: ended.y))
+                leftDown = false
+            }
+            fingerMode = .idle
+            singlePendingSince = nil
+        default:
+            break
+        }
+    }
+
+    private func finalizeInteractionEnd(now: TimeInterval,
+                                        contacts: [TouchGestureContact],
+                                        emit: (TouchGestureEffect) -> Void) {
+        if fingerMode == .multiTouch {
+            finalizeMultiGesture(emit: emit)
+        }
+        if leftDown, let t = primaryTrackedTouch() {
+            emit(.releaseLeft(x: t.lastX, y: t.lastY))
+            leftDown = false
+        }
+        emitTapIfNeeded(now: now, emit: emit)
+        fingerMode = .idle
+        singlePendingSince = nil
+        interactionStart = nil
+        interactionPeakFingers = 0
+        interactionManipulated = false
+    }
+
+    private func resetToIdle(emit: (TouchGestureEffect) -> Void) {
+        if leftDown, let t = primaryTrackedTouch() {
+            emit(.releaseLeft(x: t.lastX, y: t.lastY))
+        }
+        leftDown = false
+        tracked.removeAll()
+        fingerMode = .idle
+        singlePendingSince = nil
+        resetMultiGestureState(finalize: false)
+        interactionManipulated = false
+    }
+
+    // MARK: - Single finger
+
+    private func handleSinglePending(_ contact: TouchGestureContact,
+                                     now: TimeInterval,
+                                     emit: (TouchGestureEffect) -> Void) {
+        let x = contact.x
+        let y = contact.y
+
+        switch contact.phase {
+        case .began, .moved:
+            emit(.warpCursor(x: x, y: y))
+            tryCommitSinglePending(x: x, y: y, now: now, emit: emit)
+            if fingerMode == .singleDrawing && contact.phase == .moved {
+                emit(.dragLeft(x: x, y: y))
+            }
+        case .ended, .cancelled:
+            break
+        }
+    }
+
+    private func tryCommitSinglePending(x: Double, y: Double, now: TimeInterval,
+                                        emit: (TouchGestureEffect) -> Void) {
+        guard fingerMode == .singlePending,
+              let since = singlePendingSince,
+              now - since >= config.singlePressDefer else { return }
+        emit(.pressLeft(x: x, y: y))
+        leftDown = true
+        fingerMode = .singleDrawing
+        singlePendingSince = nil
+    }
+
+    private func handleSingleDrawing(_ contact: TouchGestureContact,
+                                     emit: (TouchGestureEffect) -> Void) {
         let x = contact.x
         let y = contact.y
 
         switch contact.phase {
         case .began:
-            if suppressSinglePress {
-                emit(.warpCursor(x: x, y: y))
-            } else {
-                emit(.pressLeft(x: x, y: y))
-                leftDown = true
-            }
+            emit(.warpCursor(x: x, y: y))
         case .moved:
             if leftDown {
                 emit(.dragLeft(x: x, y: y))
@@ -289,16 +393,14 @@ final class TouchGestureRecognizer {
                 emit(.warpCursor(x: x, y: y))
             }
         case .ended, .cancelled:
-            if leftDown {
-                emit(.releaseLeft(x: x, y: y))
-                leftDown = false
-            } else if suppressSinglePress {
-                emit(.warpCursor(x: x, y: y))
-            }
+            break
         }
+    }
 
-        _ = displayWidth
-        _ = displayHeight
+    /// After a multi-touch gesture, the surviving finger only moves the cursor.
+    private func handleRemainingFinger(_ contact: TouchGestureContact,
+                                       emit: (TouchGestureEffect) -> Void) {
+        emit(.warpCursor(x: contact.x, y: contact.y))
     }
 
     // MARK: - Two fingers
@@ -327,8 +429,6 @@ final class TouchGestureRecognizer {
         if pairStartDistance == nil { pairStartDistance = distance }
         if pairStartAngle == nil { pairStartAngle = angle }
 
-        // Cumulative movement since the pair was first seen, measured against
-        // the deadbands so an incidental tap doesn't register as a manipulation.
         let startCentroid = pairStartCentroid ?? (centroidX, centroidY)
         let travel = hypot((centroidX - startCentroid.x) * displayWidth,
                            (centroidY - startCentroid.y) * displayHeight)
@@ -409,7 +509,6 @@ final class TouchGestureRecognizer {
                             scrollPhaseActive = true
                             lockedGesture = .scroll
                         }
-                        // Natural direction: content follows the fingers on both axes.
                         emit(.scroll(dx: dxRaw, dy: -dyRaw, phase: .changed))
                     }
                 }
@@ -467,12 +566,18 @@ final class TouchGestureRecognizer {
         return byID.values.sorted { $0.id < $1.id }
     }
 
-    private func activeContactCount() -> Int {
-        tracked.count
+    private func primaryTrackedTouch() -> TrackedTouch? {
+        tracked.values.min(by: { $0.id < $1.id })
     }
 
-    /// A two/three-finger touch that lifted quickly without manipulating is a
-    /// tap: two fingers → undo, three fingers → redo.
+    private func warpToCentroid(_ active: [TouchGestureContact],
+                                emit: (TouchGestureEffect) -> Void) {
+        guard !active.isEmpty else { return }
+        let cx = active.reduce(0.0) { $0 + $1.x } / Double(active.count)
+        let cy = active.reduce(0.0) { $0 + $1.y } / Double(active.count)
+        emit(.warpCursor(x: cx, y: cy))
+    }
+
     private func emitTapIfNeeded(now: TimeInterval, emit: (TouchGestureEffect) -> Void) {
         guard !interactionManipulated,
               let start = interactionStart,
@@ -485,7 +590,7 @@ final class TouchGestureRecognizer {
     }
 
     private func retractSinglePress(emit: (TouchGestureEffect) -> Void) {
-        guard leftDown, let t = tracked.values.min(by: { $0.id < $1.id }) else { return }
+        guard leftDown, let t = primaryTrackedTouch() else { return }
         emit(.releaseLeft(x: t.lastX, y: t.lastY))
         leftDown = false
     }
@@ -513,9 +618,7 @@ final class TouchGestureRecognizer {
     }
 
     private func resetMultiGestureState(finalize: Bool) {
-        if finalize {
-            // Caller already finalized via emit.
-        }
+        _ = finalize
         prevPairDistance = nil
         prevPairAngle = nil
         scrollPrevCentroid = nil
