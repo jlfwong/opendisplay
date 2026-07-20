@@ -6,12 +6,13 @@ import UIKit
 
 /// Captures pencil, hover, and finger contact frames. Coordinates are normalized
 /// [0,1] in video space (origin top-left) via the host view's normalize closure.
-final class InputCaptureEngine: NSObject {
+final class InputCaptureEngine: NSObject, UIPencilInteractionDelegate {
     var onTouches: ((_ contacts: [WireTouchContact], _ osMs: Double, _ captureMs: Double) -> Void)?
     var onPencil: ((_ phase: PencilPhase, _ x: Double, _ y: Double,
                     _ pressure: Double, _ azimuth: Double, _ altitude: Double,
                     _ rotation: Double, _ osMs: Double, _ captureMs: Double) -> Void)?
     var onProximity: ((_ entering: Bool, _ eraser: Bool) -> Void)?
+    var onBarrelButton: ((_ down: Bool, _ x: Double, _ y: Double) -> Void)?
 
     /// Map a point in the host view to normalized video coordinates.
     var normalize: ((CGPoint) -> (x: Double, y: Double)?)?
@@ -23,6 +24,8 @@ final class InputCaptureEngine: NSObject {
     private let tapMoveThreshold: CGFloat = 8
     private var touchIds: [ObjectIdentifier: Int] = [:]
     private var nextTouchId = 1
+    /// Last known pencil position in video-normalized coords (for side-tap right click).
+    private var lastPencilNorm: (x: Double, y: Double)?
     /// Finger touches that began on the host view — excludes sidebar/rest-of-window
     /// contacts that UIKit still lists in event.allTouches during pencil moves.
     private var hostFingerTouches: Set<ObjectIdentifier> = []
@@ -39,6 +42,17 @@ final class InputCaptureEngine: NSObject {
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
         hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
         view.addGestureRecognizer(hover)
+
+        let pencilInteraction = UIPencilInteraction()
+        pencilInteraction.delegate = self
+        view.addInteraction(pencilInteraction)
+    }
+
+    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        guard let (nx, ny) = lastPencilNorm else { return }
+        logCapture("pencil side tap → right click @ \(fmt(nx, ny))")
+        onBarrelButton?(true, nx, ny)
+        onBarrelButton?(false, nx, ny)
     }
 
     private func norm(_ p: CGPoint) -> (Double, Double)? {
@@ -55,6 +69,7 @@ final class InputCaptureEngine: NSObject {
     private func emitPencil(_ phase: PencilPhase, x: Double, y: Double,
                             pressure: Double, azimuth: Double, altitude: Double,
                             rotation: Double, osDeliveredMs: Double) {
+        lastPencilNorm = (x, y)
         let captureMs = Date().timeIntervalSince1970 * 1000
         onPencil?(phase, x, y, pressure, azimuth, altitude, rotation, osDeliveredMs, captureMs)
     }

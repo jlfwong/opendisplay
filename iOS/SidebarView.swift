@@ -14,6 +14,12 @@ struct SidebarView: View {
                     SidebarKeyButton(label: "⌥", accessibilityLabel: "Option") { down in
                         onKey(WireKeyCode.option, down)
                     }
+                    SidebarKeyButton(label: "⇧", accessibilityLabel: "Shift") { down in
+                        onKey(WireKeyCode.shift, down)
+                    }
+                    SidebarKeyButton(label: "⌃", accessibilityLabel: "Control") { down in
+                        onKey(WireKeyCode.control, down)
+                    }
                     SidebarKeyButton(label: "Z", accessibilityLabel: "Z") { down in
                         onKey(WireKeyCode.z, down)
                     }

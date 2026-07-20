@@ -675,6 +675,9 @@ struct VideoLayerView: UIViewRepresentable {
         view.inputEngine.onProximity = { [weak receiver] entering, eraser in
             receiver?.sendProximity(entering: entering, eraser: eraser)
         }
+        view.inputEngine.onBarrelButton = { [weak receiver] down, x, y in
+            receiver?.sendBarrelButton(down: down, x: x, y: y)
+        }
         view.inputEngine.install(on: view)
 
         // Local cursor echo: position updates ride the ~2ms control path

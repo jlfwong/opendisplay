@@ -5,6 +5,7 @@
 //   touches contact frames → TouchGestureRecognizer → mouse / scroll / pinch / undo / redo
 //   Pencil stroke → tablet pen; pencil tap (no movement) → left click
 //   Pencil hover → cursor move without drawing
+//   Pencil side double-tap → right click (barrelButton)
 
 import Foundation
 
@@ -19,6 +20,10 @@ enum WireInput {
 enum WireKeyCode {
     /// kVK_Option (left Option)
     static let option: UInt16 = 0x3A
+    /// kVK_Shift (left Shift)
+    static let shift: UInt16 = 0x38
+    /// kVK_Control (left Control)
+    static let control: UInt16 = 0x3B
     /// kVK_ANSI_A
     static let a: UInt16 = 0x00
     /// kVK_ANSI_Z
