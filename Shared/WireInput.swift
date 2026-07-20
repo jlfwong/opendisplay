@@ -19,6 +19,12 @@ enum WireInput {
 enum WireKeyCode {
     /// kVK_Option (left Option)
     static let option: UInt16 = 0x3A
+    /// kVK_ANSI_A
+    static let a: UInt16 = 0x00
+    /// kVK_ANSI_Z
+    static let z: UInt16 = 0x06
+    /// kVK_ANSI_R
+    static let r: UInt16 = 0x0F
 }
 
 enum PencilPhase: String {

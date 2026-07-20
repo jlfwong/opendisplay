@@ -9,14 +9,21 @@ struct SidebarView: View {
         Color(white: 0.15)
             .frame(width: width)
             .frame(maxHeight: .infinity)
-            .overlay(alignment: .top) {
+            .overlay(alignment: .center) {
                 VStack(spacing: 10) {
                     SidebarKeyButton(label: "⌥", accessibilityLabel: "Option") { down in
                         onKey(WireKeyCode.option, down)
                     }
-                    Spacer(minLength: 0)
+                    SidebarKeyButton(label: "Z", accessibilityLabel: "Z") { down in
+                        onKey(WireKeyCode.z, down)
+                    }
+                    SidebarKeyButton(label: "R", accessibilityLabel: "R") { down in
+                        onKey(WireKeyCode.r, down)
+                    }
+                    SidebarKeyButton(label: "A", accessibilityLabel: "A") { down in
+                        onKey(WireKeyCode.a, down)
+                    }
                 }
-                .padding(.top, 12)
                 .padding(.horizontal, 8)
             }
     }
