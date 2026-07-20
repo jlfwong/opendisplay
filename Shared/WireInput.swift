@@ -2,10 +2,8 @@
 // control channel. JSON-encoded, one framed message per event.
 //
 // Finger mapping (Mac interprets):
-//   1 finger tap/drag → left mouse click/drag
-//   2 finger tap → Cmd+Z undo; 3 finger tap → Cmd+Shift+Z redo
-//   2 finger pinch → Control+scroll zoom at pinch centroid
-//   Pencil stroke → tablet pen; pencil tap (no movement) → right click
+//   All non-pencil contacts → TouchGestureRecognizer → mouse / trackpad gestures
+//   Pencil stroke → tablet pen; pencil tap (no movement) → left tablet click
 //   Pencil hover → cursor move without drawing
 
 import Foundation
@@ -15,10 +13,26 @@ enum WireInput {
     static let proximity = "proximity"
     static let gesture = "gesture"
     static let barrelButton = "barrelButton"
+    static let touches = "touches"
 }
 
 enum PencilPhase: String {
     case down, move, up, hover
+}
+
+enum TouchContactPhase: String, Codable {
+    case began, moved, ended, cancelled
+}
+
+/// One finger contact in a `touches` frame.
+struct WireTouchContact: Codable, Equatable {
+    let id: Int
+    let phase: TouchContactPhase
+    /// Video-normalized [0,1], origin top-left.
+    let x: Double
+    let y: Double
+    /// Normalized contact major radius (optional).
+    var major: Double?
 }
 
 enum GestureKind: String {

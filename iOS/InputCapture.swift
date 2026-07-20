@@ -1,21 +1,17 @@
-// InputCaptureEngine: Apple Pencil + multi-touch with full fidelity.
+// InputCaptureEngine: Apple Pencil + raw finger contacts.
 // Installed on VideoView (not a separate overlay) so hit-testing matches
 // the pre-port behavior that finger touches relied on.
 
 import UIKit
 
-/// Captures pencil, hover, and gesture input. Coordinates are normalized
+/// Captures pencil, hover, and finger contact frames. Coordinates are normalized
 /// [0,1] in video space (origin top-left) via the host view's normalize closure.
 final class InputCaptureEngine: NSObject {
-    var onTouch: ((_ phase: String, _ x: Double, _ y: Double,
-                     _ osMs: Double, _ captureMs: Double) -> Void)?
+    var onTouches: ((_ contacts: [WireTouchContact], _ osMs: Double, _ captureMs: Double) -> Void)?
     var onPencil: ((_ phase: PencilPhase, _ x: Double, _ y: Double,
                     _ pressure: Double, _ azimuth: Double, _ altitude: Double,
                     _ rotation: Double, _ osMs: Double, _ captureMs: Double) -> Void)?
     var onProximity: ((_ entering: Bool, _ eraser: Bool) -> Void)?
-    var onGesture: ((_ kind: GestureKind, _ state: GestureState,
-                     _ scale: Double?, _ velocity: Double?,
-                     _ x: Double?, _ y: Double?, _ fingerCount: Int?) -> Void)?
 
     /// Map a point in the host view to normalized video coordinates.
     var normalize: ((CGPoint) -> (x: Double, y: Double)?)?
@@ -23,11 +19,10 @@ final class InputCaptureEngine: NSObject {
     private weak var hostView: UIView?
     private var activePens: Set<UInt64> = []
     private var hoverInRange = false
-    private var activeFingerTouches: Set<ObjectIdentifier> = []
     private var penStrokes: [UInt64: PenStroke] = [:]
     private let tapMoveThreshold: CGFloat = 8
-    private var lastFingerNorm: (x: Double, y: Double)?
-    private var sentCancelForBlock = false
+    private var touchIds: [ObjectIdentifier: Int] = [:]
+    private var nextTouchId = 1
 
     private struct PenStroke {
         var start: CGPoint
@@ -41,18 +36,6 @@ final class InputCaptureEngine: NSObject {
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
         hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
         view.addGestureRecognizer(hover)
-
-        let twoFingerTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTapped(_:)))
-        twoFingerTap.numberOfTouchesRequired = 2
-        twoFingerTap.numberOfTapsRequired = 1
-        twoFingerTap.cancelsTouchesInView = false
-        view.addGestureRecognizer(twoFingerTap)
-
-        let threeFingerTap = UITapGestureRecognizer(target: self, action: #selector(threeFingerTapped(_:)))
-        threeFingerTap.numberOfTouchesRequired = 3
-        threeFingerTap.numberOfTapsRequired = 1
-        threeFingerTap.cancelsTouchesInView = false
-        view.addGestureRecognizer(threeFingerTap)
     }
 
     private func norm(_ p: CGPoint) -> (Double, Double)? {
@@ -60,24 +43,10 @@ final class InputCaptureEngine: NSObject {
         return (n.x, n.y)
     }
 
-    private func gestureCentroid(_ gr: UIGestureRecognizer) -> (Double, Double)? {
-        guard let view = hostView else { return nil }
-        guard gr.numberOfTouches > 0 else {
-            return norm(gr.location(in: view)).map { ($0.0, $0.1) }
-        }
-        var sum = CGPoint.zero
-        for i in 0..<gr.numberOfTouches {
-            sum.x += gr.location(ofTouch: i, in: view).x
-            sum.y += gr.location(ofTouch: i, in: view).y
-        }
-        sum.x /= CGFloat(gr.numberOfTouches)
-        sum.y /= CGFloat(gr.numberOfTouches)
-        return norm(sum).map { ($0.0, $0.1) }
-    }
-
-    private func emitTouch(phase: String, x: Double, y: Double, osDeliveredMs: Double) {
+    private func emitTouches(_ contacts: [WireTouchContact], osDeliveredMs: Double) {
+        guard !contacts.isEmpty else { return }
         let captureMs = Date().timeIntervalSince1970 * 1000
-        onTouch?(phase, x, y, osDeliveredMs, captureMs)
+        onTouches?(contacts, osDeliveredMs, captureMs)
     }
 
     private func emitPencil(_ phase: PencilPhase, x: Double, y: Double,
@@ -114,14 +83,6 @@ final class InputCaptureEngine: NSObject {
 
     // MARK: - Touch (pen / finger on screen)
 
-    private func trackFingerTouches(_ touches: Set<UITouch>, ended: Bool) {
-        for touch in touches where isFinger(touch) {
-            let key = ObjectIdentifier(touch)
-            if ended { activeFingerTouches.remove(key) }
-            else { activeFingerTouches.insert(key) }
-        }
-    }
-
     private func isFinger(_ touch: UITouch) -> Bool {
         switch touch.type {
         case .direct: return true
@@ -131,18 +92,66 @@ final class InputCaptureEngine: NSObject {
         }
     }
 
+    private func touchId(for touch: UITouch) -> Int {
+        let key = ObjectIdentifier(touch)
+        if let existing = touchIds[key] { return existing }
+        let id = nextTouchId
+        nextTouchId += 1
+        touchIds[key] = id
+        return id
+    }
+
+    private func releaseTouchId(_ touch: UITouch) {
+        touchIds.removeValue(forKey: ObjectIdentifier(touch))
+    }
+
     func handle(_ touches: Set<UITouch>, event: UIEvent?, phase: String, ended: Bool,
                 osDeliveredMs: Double) {
-        trackFingerTouches(touches, ended: ended)
-        let blockFinger = activeFingerTouches.count > 1
-        if blockFinger {
-            if !sentCancelForBlock, let last = lastFingerNorm {
-                logCapture("block finger phase=\(phase) activeFingers=\(activeFingerTouches.count) — cancel once")
-                emitTouch(phase: "cancelled", x: last.x, y: last.y, osDeliveredMs: osDeliveredMs)
-                sentCancelForBlock = true
+        guard let view = hostView else { return }
+
+        var fingerContacts: [WireTouchContact] = []
+        let allFingerTouches = (event?.allTouches ?? touches).filter { isFinger($0) }
+
+        for touch in allFingerTouches {
+            let contactPhase: TouchContactPhase
+            if touches.contains(touch) {
+                if ended {
+                    contactPhase = phase == "cancelled" ? .cancelled : .ended
+                } else if phase == "began" {
+                    contactPhase = .began
+                } else {
+                    contactPhase = .moved
+                }
+            } else if touch.phase == .stationary || touch.phase == .began || touch.phase == .moved {
+                contactPhase = .moved
+            } else {
+                continue
             }
-        } else {
-            sentCancelForBlock = false
+
+            let locations: [CGPoint]
+            if touches.contains(touch), phase == "moved", let event {
+                locations = (event.coalescedTouches(for: touch) ?? [touch]).map { $0.location(in: view) }
+            } else {
+                locations = [touch.location(in: view)]
+            }
+
+            for loc in locations {
+                guard let (nx, ny) = norm(loc) else { continue }
+                let major = normalizedMajorRadius(touch, in: view)
+                fingerContacts.append(WireTouchContact(id: touchId(for: touch),
+                                                         phase: contactPhase,
+                                                         x: nx, y: ny,
+                                                         major: major))
+            }
+
+            if contactPhase == .ended || contactPhase == .cancelled {
+                releaseTouchId(touch)
+            }
+        }
+
+        if !fingerContacts.isEmpty {
+            logCapture("touches \(fingerContacts.count) contacts")
+            emitTouches(fingerContacts, osDeliveredMs: osDeliveredMs)
         }
 
         for touch in touches {
@@ -150,11 +159,15 @@ final class InputCaptureEngine: NSObject {
             case .pencil, .stylus:
                 emitPen(touch, event: event, ended: ended, osDeliveredMs: osDeliveredMs)
             default:
-                guard isFinger(touch) else { continue }
-                guard !blockFinger, activeFingerTouches.count <= 1 else { continue }
-                emitFinger(touch, event: event, phase: phase, osDeliveredMs: osDeliveredMs)
+                break
             }
         }
+    }
+
+    private func normalizedMajorRadius(_ touch: UITouch, in view: UIView) -> Double {
+        let radius = touch.majorRadius
+        guard radius > 0, view.bounds.width > 0 else { return 0.02 }
+        return min(0.15, Double(radius / view.bounds.width))
     }
 
     private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool, osDeliveredMs: Double) {
@@ -228,57 +241,11 @@ final class InputCaptureEngine: NSObject {
         emitPencil(.up, x: nx, y: ny, pressure: 0, azimuth: azimuth, altitude: altitude, rotation: rotationDeg, osDeliveredMs: osDeliveredMs)
     }
 
-    private func emitFinger(_ touch: UITouch, event: UIEvent?, phase: String,
-                            osDeliveredMs: Double) {
-        guard let view = hostView else { return }
-        if phase == "moved", let event {
-            for t in event.coalescedTouches(for: touch) ?? [touch] {
-                guard let n = norm(t.location(in: view)) else { continue }
-                lastFingerNorm = (x: n.0, y: n.1)
-                emitTouch(phase: "moved", x: n.0, y: n.1, osDeliveredMs: osDeliveredMs)
-            }
-            if let predicted = event.predictedTouches(for: touch)?.last,
-               let n = norm(predicted.location(in: view)) {
-                emitTouch(phase: "moved", x: n.0, y: n.1, osDeliveredMs: osDeliveredMs)
-            }
-            return
-        }
-        guard let n = norm(touch.location(in: view)) else {
-            logCapture("finger \(phase) DROPPED (normalize nil)")
-            return
-        }
-        lastFingerNorm = (x: n.0, y: n.1)
-        if phase != "moved" { logCapture("finger \(phase) @ \(fmt(n.0, n.1))") }
-        emitTouch(phase: phase, x: n.0, y: n.1, osDeliveredMs: osDeliveredMs)
-    }
-
-    @objc private func twoFingerTapped(_ gr: UITapGestureRecognizer) {
-        guard gr.state == .ended, let (nx, ny) = gestureCentroid(gr) else { return }
-        logCapture("two-finger tap @ \(fmt(nx, ny))")
-        onGesture?(.tap, .ended, nil, nil, nx, ny, 2)
-    }
-
-    @objc private func threeFingerTapped(_ gr: UITapGestureRecognizer) {
-        guard gr.state == .ended, let (nx, ny) = gestureCentroid(gr) else { return }
-        logCapture("three-finger tap @ \(fmt(nx, ny))")
-        onGesture?(.tap, .ended, nil, nil, nx, ny, 3)
-    }
-
     private func logCapture(_ message: String) {
         Log.info("[input] capture \(message)")
     }
 
     private func fmt(_ x: Double, _ y: Double) -> String {
         String(format: "%.3f,%.3f", x, y)
-    }
-
-    private func gestureState(_ s: UIGestureRecognizer.State) -> GestureState {
-        switch s {
-        case .began: return .began
-        case .changed: return .changed
-        case .ended: return .ended
-        case .cancelled: return .cancelled
-        default: return .changed
-        }
     }
 }

@@ -1148,7 +1148,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
-        case "touch", WireInput.pencil, WireInput.proximity,
+        case "touch", WireInput.touches, WireInput.pencil, WireInput.proximity,
              WireInput.gesture, WireInput.barrelButton, "scroll":
             logInputWire(obj)
             let inpId = obj["inpId"] as? Int
@@ -1175,7 +1175,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if pencilPhase == "ended" || pencilPhase == "cancelled" {
                     InputRecvSignpost.endStroke()
                 }
-            } else if type == "touch",
+            } else if type == "touch" || type == WireInput.touches,
                       pencilPhase == "ended" || pencilPhase == "cancelled" {
                 InputRecvSignpost.endStroke()
             }
@@ -1209,7 +1209,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func logInputWire(_ obj: [String: Any]) {
         guard let type = obj["type"] as? String else { return }
         let phase = obj["phase"] as? String ?? ""
-        if type == "touch" && phase == "moved" { return }
+        if (type == "touch" || type == WireInput.touches) && phase == "moved" { return }
         if type == WireInput.pencil && (phase == "move" || phase == "hover") { return }
         let x = obj["x"] as? Double
         let y = obj["y"] as? Double

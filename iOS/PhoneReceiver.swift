@@ -622,6 +622,55 @@ final class PhoneReceiver: ObservableObject {
         Log.info("hello sent")
     }
 
+    /// Finger contact frames: normalized [0,1] in video space, origin top-left.
+    func sendTouches(contacts: [WireTouchContact], osMs: Double, captureMs: Double) {
+        guard !contacts.isEmpty else { return }
+        let devMs = nowMs
+        let macMs = clockOffsetMs.map { devMs + $0 }
+        let contactDicts: [[String: Any]] = contacts.map { c in
+            var d: [String: Any] = [
+                "id": c.id,
+                "phase": c.phase.rawValue,
+                "x": c.x,
+                "y": c.y,
+            ]
+            if let major = c.major { d["major"] = major }
+            return d
+        }
+        let wirePhase = wirePhase(for: contacts)
+        var msg: [String: Any] = [
+            "type": WireInput.touches,
+            "phase": wirePhase,
+            "contacts": contactDicts,
+            "tDev": devMs,
+        ]
+        if let macMs { msg["t"] = macMs }
+        queue.async {
+            let queueMs = self.nowMs
+            var inpId: Int?
+            var traceThis = false
+            if self.shouldTraceInput(phase: wirePhase) {
+                inpId = IPadTrace.nextInputId()
+                traceThis = true
+                msg["inpId"] = inpId
+            }
+            self.sendControl(msg, stampWire: inpId != nil) {
+                guard traceThis, let inpId else { return }
+                IPadTrace.recordInput(inputId: inpId, phase: wirePhase,
+                                      osMs: osMs, captureMs: captureMs,
+                                      queueMs: queueMs, sendMs: self.nowMs)
+            }
+        }
+    }
+
+    private func wirePhase(for contacts: [WireTouchContact]) -> String {
+        if contacts.contains(where: { $0.phase == .began }) { return "began" }
+        if contacts.contains(where: { $0.phase == .ended || $0.phase == .cancelled }) {
+            return "ended"
+        }
+        return "moved"
+    }
+
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
     /// measure touch→injection latency without doing its own clock sync.

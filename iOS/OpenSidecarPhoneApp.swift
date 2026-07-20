@@ -648,8 +648,8 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
-        view.inputEngine.onTouch = { [weak receiver] phase, x, y, osMs, captureMs in
-            receiver?.sendTouch(phase: phase, x: x, y: y, osMs: osMs, captureMs: captureMs)
+        view.inputEngine.onTouches = { [weak receiver] contacts, osMs, captureMs in
+            receiver?.sendTouches(contacts: contacts, osMs: osMs, captureMs: captureMs)
         }
         view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation, osMs, captureMs in
             receiver?.sendPencil(phase: phase, x: x, y: y,
@@ -659,10 +659,6 @@ struct VideoLayerView: UIViewRepresentable {
         }
         view.inputEngine.onProximity = { [weak receiver] entering, eraser in
             receiver?.sendProximity(entering: entering, eraser: eraser)
-        }
-        view.inputEngine.onGesture = { [weak receiver] kind, state, scale, velocity, x, y, fingerCount in
-            receiver?.sendGesture(kind: kind, state: state, scale: scale,
-                                  velocity: velocity, x: x, y: y, fingerCount: fingerCount)
         }
         view.inputEngine.install(on: view)
 

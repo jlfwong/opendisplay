@@ -83,7 +83,7 @@ enum InputRecvSignpost {
 
     private static func isStrokePhase(type: String, phase: String?) -> Bool {
         switch type {
-        case WireInput.pencil, "touch":
+        case WireInput.pencil, "touch", WireInput.touches:
             guard let phase else { return true }
             return phase == "began" || phase == "moved"
                 || phase == "ended" || phase == "cancelled"
@@ -101,7 +101,7 @@ enum InputRecvSignpost {
             return phase != "hover"
         case WireInput.proximity:
             return false
-        case "touch", "scroll", WireInput.gesture, WireInput.barrelButton:
+        case "touch", WireInput.touches, "scroll", WireInput.gesture, WireInput.barrelButton:
             return true
         default:
             return false

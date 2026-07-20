@@ -16,7 +16,10 @@ final class InputInjector {
     private var inRange = false
     private var penDown = false
     private var fingerDown = false
+    private var touchLeftDown = false
     private var eraser = false
+
+    private let touchRecognizer: TouchGestureRecognizer
 
     private let deviceID: Int64 = 1
     private let vendorID: Int64 = 0x056A
@@ -31,6 +34,9 @@ final class InputInjector {
         } else {
             fatalError("Could not create CGEventSource")
         }
+        let sink = InputInjectorTouchSink()
+        touchRecognizer = TouchGestureRecognizer(config: TouchGestureConfig(), sink: sink)
+        sink.injector = self
     }
 
     static func ensureAccessibilityPermission() -> Bool {
@@ -48,6 +54,8 @@ final class InputInjector {
         guard let type = obj["type"] as? String else { return }
         logRecv(type, obj)
         switch type {
+        case WireInput.touches:
+            handleTouches(obj)
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
@@ -146,7 +154,66 @@ final class InputInjector {
         return (sin(azimuth) * mag, cos(azimuth) * mag)
     }
 
-    // MARK: - Touch (single-finger mouse)
+    // MARK: - Multi-touch (gesture recognizer)
+
+    private func handleTouches(_ obj: [String: Any]) {
+        guard let arr = obj["contacts"] as? [[String: Any]], !arr.isEmpty else { return }
+
+        var contacts: [TouchGestureContact] = []
+        var anyActive = false
+        for c in arr {
+            guard let id = c["id"] as? Int,
+                  let phaseStr = c["phase"] as? String,
+                  let phase = TouchContactPhase(rawValue: phaseStr),
+                  let x = c["x"] as? Double,
+                  let y = c["y"] as? Double else { continue }
+            contacts.append(TouchGestureContact(id: id, phase: phase, x: x, y: y))
+            if phase == .began || phase == .moved { anyActive = true }
+        }
+        guard !contacts.isEmpty else { return }
+
+        let bounds = CGDisplayBounds(displayID)
+        let emitted = touchRecognizer.process(TouchGestureFrame(
+            timestamp: Date().timeIntervalSince1970,
+            displayWidth: Double(bounds.width),
+            displayHeight: Double(bounds.height),
+            contacts: contacts
+        ))
+
+        fingerDown = anyActive || touchLeftDown
+
+        if contacts.contains(where: { $0.phase == .began }) {
+            logState("touches began (\(contacts.count) contacts)")
+        } else if !anyActive {
+            logState("touches ended (\(contacts.count) contacts)")
+        }
+        if emitted { markInjected() }
+    }
+
+    // MARK: - Touch gesture effects (called by InputInjectorTouchSink)
+
+    fileprivate func applyTouchEffect(_ effect: TouchGestureEffect) {
+        switch effect {
+        case .pressLeft(let x, let y):
+            touchLeftDown = true
+            postMouse(type: .leftMouseDown, at: screenPoint(nx: x, ny: y), button: .left)
+        case .dragLeft(let x, let y):
+            postMouse(type: .leftMouseDragged, at: screenPoint(nx: x, ny: y), button: .left)
+        case .releaseLeft(let x, let y):
+            touchLeftDown = false
+            postMouse(type: .leftMouseUp, at: screenPoint(nx: x, ny: y), button: .left)
+        case .warpCursor(let x, let y):
+            postMouse(type: .mouseMoved, at: screenPoint(nx: x, ny: y), button: .left)
+        case .magnify(let amount, let phase):
+            postMagnify(amount: amount, phase: phase)
+        case .rotate(let degrees, let phase):
+            postRotate(degrees: degrees, phase: phase)
+        case .scroll(let dx, let dy, let phase):
+            postScrollPhased(dx: dx, dy: dy, phase: phase)
+        }
+    }
+
+    // MARK: - Touch (single-finger mouse, legacy wire)
 
     func handleTouch(phase: String, x: Double, y: Double) {
         let p = screenPoint(nx: x, ny: y)
@@ -213,13 +280,74 @@ final class InputInjector {
 
     /// dx/dy in display pixels, natural-scrolling sign from the phone.
     func handleScroll(dx: Double, dy: Double) {
-        let bounds = CGDisplayBounds(displayID)
-        let scale = bounds.width > 0 ? Double(CGDisplayPixelsWide(displayID)) / bounds.width : 2
+        postScrollPhased(dx: dx, dy: dy, phase: .changed)
+    }
+
+    private enum GestureEventField: Int {
+        case subtype = 110
+        case phase = 132
+        case value = 113
+    }
+
+    private enum GestureSubtype: Int64 {
+        case rotate = 5
+        case magnify = 8
+    }
+
+    private static let gestureEventType = CGEventType(rawValue: 29)!
+
+    private func gestureField(_ raw: Int) -> CGEventField {
+        CGEventField(rawValue: UInt32(raw))!
+    }
+
+    private func nsPhase(_ phase: TouchGesturePhase) -> Int64 {
+        switch phase {
+        case .began: return 1
+        case .changed: return 4
+        case .ended: return 8
+        }
+    }
+
+    private func postMagnify(amount: Double, phase: TouchGesturePhase) {
+        guard let event = CGEvent(source: source) else { return }
+        event.type = Self.gestureEventType
+        event.setIntegerValueField(gestureField(GestureEventField.subtype.rawValue),
+                                   value: GestureSubtype.magnify.rawValue)
+        event.setIntegerValueField(gestureField(GestureEventField.phase.rawValue),
+                                   value: nsPhase(phase))
+        event.setDoubleValueField(gestureField(GestureEventField.value.rawValue), value: amount)
+        event.post(tap: .cghidEventTap)
+    }
+
+    private func postRotate(degrees: Double, phase: TouchGesturePhase) {
+        guard let event = CGEvent(source: source) else { return }
+        event.type = Self.gestureEventType
+        event.setIntegerValueField(gestureField(GestureEventField.subtype.rawValue),
+                                   value: GestureSubtype.rotate.rawValue)
+        event.setIntegerValueField(gestureField(GestureEventField.phase.rawValue),
+                                   value: nsPhase(phase))
+        event.setDoubleValueField(gestureField(GestureEventField.value.rawValue), value: degrees)
+        event.post(tap: .cghidEventTap)
+    }
+
+    private func postScrollPhased(dx: Double, dy: Double, phase: TouchGesturePhase) {
+        let scrollPhase: CGScrollPhase
+        switch phase {
+        case .began: scrollPhase = .began
+        case .changed: scrollPhase = .changed
+        case .ended: scrollPhase = .ended
+        }
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
                                   wheelCount: 2,
-                                  wheel1: Int32((dy / scale).rounded()),
-                                  wheel2: Int32((dx / scale).rounded()),
+                                  wheel1: Int32(dy.rounded()),
+                                  wheel2: Int32(dx.rounded()),
                                   wheel3: 0) else { return }
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(scrollPhase.rawValue))
+        let fixed1 = Int64((dy * 65536.0).rounded())
+        let fixed2 = Int64((dx * 65536.0).rounded())
+        if let axis1 = CGEventField(rawValue: 93) { event.setIntegerValueField(axis1, value: fixed1) }
+        if let axis2 = CGEventField(rawValue: 94) { event.setIntegerValueField(axis2, value: fixed2) }
         event.post(tap: .cghidEventTap)
     }
 
@@ -337,6 +465,13 @@ final class InputInjector {
 
     private func logRecv(_ type: String, _ obj: [String: Any]) {
         switch type {
+        case WireInput.touches:
+            if let contacts = obj["contacts"] as? [[String: Any]] {
+                let wirePhase = obj["phase"] as? String ?? "?"
+                if wirePhase != "moved" {
+                    Log.info("[input] recv touches \(wirePhase) n=\(contacts.count) | \(stateLine())")
+                }
+            }
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double, let y = obj["y"] as? Double {
@@ -388,5 +523,15 @@ final class InputInjector {
         if !flags.isEmpty { parts.append("flags=0x\(String(flags.rawValue, radix: 16))") }
         parts.append("| \(stateLine())")
         Log.info("[input] post " + parts.joined(separator: " "))
+    }
+}
+
+// MARK: - Touch gesture sink
+
+private final class InputInjectorTouchSink: TouchGestureSink {
+    weak var injector: InputInjector?
+
+    func emit(_ effect: TouchGestureEffect) {
+        injector?.applyTouchEffect(effect)
     }
 }
