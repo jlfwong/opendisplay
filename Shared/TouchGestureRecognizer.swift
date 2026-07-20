@@ -60,12 +60,8 @@ final class RecordingTouchGestureSink: TouchGestureSink {
 // MARK: - Configuration
 
 struct TouchGestureConfig: Equatable {
-    /// Minimum inter-finger distance change (display points) to start pinch.
+    /// Minimum inter-finger distance change (display points) per frame to emit pinch.
     var pinchDistanceThreshold: Double = 1.5
-    /// Minimum finger separation (display points) before rotation is considered.
-    var rotateMinSeparation: Double = 80
-    /// Minimum angle delta (radians) per frame for rotation.
-    var rotateAngleThreshold: Double = 0.01
     // Deadbands: cumulative movement a two-finger touch must travel before it's
     // read as a manipulation. Larger values keep a two-finger *tap* from being
     // mistaken for a pan/pinch, so tap → undo stays reliable.
@@ -73,8 +69,6 @@ struct TouchGestureConfig: Equatable {
     var panStartThreshold: Double = 10
     /// Finger-separation change (display points) before pinch begins.
     var pinchStartThreshold: Double = 10
-    /// Rotation (radians) before rotate begins.
-    var rotateStartThreshold: Double = 0.18
     /// A two/three-finger touch that lifts within this window — without ever
     /// crossing a manipulation deadband — is a tap (undo / redo).
     var tapMaxDuration: TimeInterval = 0.35
@@ -107,10 +101,6 @@ final class TouchGestureRecognizer {
         case multiTouch
     }
 
-    private enum ActiveGesture {
-        case pinch, rotate, scroll
-    }
-
     private var tracked: [Int: TrackedTouch] = [:]
     private var lastTimestamp: TimeInterval?
 
@@ -119,16 +109,12 @@ final class TouchGestureRecognizer {
     private var leftDown = false
 
     private var prevPairDistance: Double?
-    private var prevPairAngle: Double?
     private var scrollPrevCentroid: (x: Double, y: Double)?
     private var pinchActive = false
-    private var rotateActive = false
     private var scrollPhaseActive = false
-    private var lockedGesture: ActiveGesture?
 
     private var pairStartCentroid: (x: Double, y: Double)?
     private var pairStartDistance: Double?
-    private var pairStartAngle: Double?
 
     private var interactionStart: TimeInterval?
     private var interactionPeakFingers = 0
@@ -433,7 +419,6 @@ final class TouchGestureRecognizer {
         let centroidX = (a.x + b.x) / 2
         let centroidY = (a.y + b.y) / 2
         let distance = hypot(ax - bx, ay - by)
-        let angle = atan2(by - ay, bx - ax)
 
         if contacts.count >= 3 {
             warpToCentroid(contacts, emit: emit)
@@ -443,11 +428,9 @@ final class TouchGestureRecognizer {
 
         if pairStartCentroid == nil { pairStartCentroid = (centroidX, centroidY) }
         if pairStartDistance == nil { pairStartDistance = distance }
-        if pairStartAngle == nil { pairStartAngle = angle }
 
         guard multiTouchManipulationAllowed(fingerCount: contacts.count, now: now) else {
             prevPairDistance = distance
-            prevPairAngle = angle
             scrollPrevCentroid = (centroidX, centroidY)
             return
         }
@@ -456,11 +439,9 @@ final class TouchGestureRecognizer {
         let travel = hypot((centroidX - startCentroid.x) * displayWidth,
                            (centroidY - startCentroid.y) * displayHeight)
         let separationChange = abs(distance - (pairStartDistance ?? distance))
-        let rotationSoFar = abs(angle - (pairStartAngle ?? angle))
-        let deadbandCrossed = scrollPhaseActive || pinchActive || rotateActive
+        let deadbandCrossed = scrollPhaseActive || pinchActive
             || travel > config.panStartThreshold
             || separationChange > config.pinchStartThreshold
-            || (rotationSoFar > config.rotateStartThreshold && distance > config.rotateMinSeparation)
 
         if deadbandCrossed, let prevDist = prevPairDistance {
             interactionManipulated = true
@@ -474,101 +455,35 @@ final class TouchGestureRecognizer {
                 centDelta = 0
             }
 
-            let kind: ClassifiedGesture
-            if let locked = lockedGesture {
-                switch locked {
-                case .pinch: kind = .pinch
-                case .rotate: kind = .rotate
-                case .scroll: kind = .scroll
-                }
-            } else if travel >= separationChange {
-                lockedGesture = .scroll
-                kind = .scroll
-            } else if separationChange > travel {
-                lockedGesture = .pinch
-                kind = .pinch
-            } else {
-                kind = classifyGesture(
-                    distDelta: distDelta,
-                    centDelta: centDelta,
-                    angleDelta: prevPairAngle.map { angle - $0 },
-                    separation: distance
-                )
-                switch kind {
-                case .pinch: lockedGesture = .pinch
-                case .rotate: lockedGesture = .rotate
-                case .scroll: lockedGesture = .scroll
-                case .none: break
-                }
-            }
-
-            switch kind {
-            case .pinch:
+            // Magnify before scroll — zoom anchors at warpCursor centroid.
+            let pinchEligible = pinchActive || separationChange > config.pinchStartThreshold
+            if pinchEligible,
+               abs(distDelta) > config.pinchDistanceThreshold,
+               abs(distDelta) > centDelta * 0.6 {
                 if !pinchActive {
                     emit(.magnify(amount: 0, phase: .began))
                     pinchActive = true
-                    lockedGesture = .pinch
                 }
                 let amount = distDelta / 200.0
                 emit(.magnify(amount: amount, phase: .changed))
-            case .rotate:
-                if !rotateActive, let prevAngle = prevPairAngle {
-                    emit(.rotate(degrees: 0, phase: .began))
-                    rotateActive = true
-                    lockedGesture = .rotate
-                    let degrees = (angle - prevAngle) * 180 / .pi
-                    emit(.rotate(degrees: degrees, phase: .changed))
-                } else if rotateActive, let prevAngle = prevPairAngle {
-                    let degrees = (angle - prevAngle) * 180 / .pi
-                    emit(.rotate(degrees: degrees, phase: .changed))
-                }
-            case .scroll:
-                if let prev = scrollPrevCentroid {
-                    let dxRaw = (centroidX - prev.x) * displayWidth
-                    let dyRaw = (centroidY - prev.y) * displayHeight
-                    if dxRaw != 0 || dyRaw != 0 {
-                        if !scrollPhaseActive {
-                            emit(.scroll(dx: 0, dy: 0, phase: .began))
-                            scrollPhaseActive = true
-                            lockedGesture = .scroll
-                        }
-                        emit(.scroll(dx: dxRaw, dy: dyRaw, phase: .changed))
+            }
+
+            let panEligible = scrollPhaseActive || travel > config.panStartThreshold
+            if panEligible, let prev = scrollPrevCentroid {
+                let dxRaw = (centroidX - prev.x) * displayWidth
+                let dyRaw = (centroidY - prev.y) * displayHeight
+                if dxRaw != 0 || dyRaw != 0 {
+                    if !scrollPhaseActive {
+                        emit(.scroll(dx: 0, dy: 0, phase: .began))
+                        scrollPhaseActive = true
                     }
+                    emit(.scroll(dx: dxRaw, dy: dyRaw, phase: .changed))
                 }
-            case .none:
-                break
             }
         }
 
         prevPairDistance = distance
-        prevPairAngle = angle
         scrollPrevCentroid = (centroidX, centroidY)
-    }
-
-    private enum ClassifiedGesture {
-        case pinch, rotate, scroll, none
-    }
-
-    private func classifyGesture(distDelta: Double,
-                               centDelta: Double,
-                               angleDelta: Double?,
-                               separation: Double) -> ClassifiedGesture {
-        if centDelta > 0 && centDelta >= abs(distDelta) {
-            return .scroll
-        }
-        if abs(distDelta) > config.pinchDistanceThreshold
-            && abs(distDelta) > centDelta * 0.6 {
-            return .pinch
-        }
-        if let delta = angleDelta,
-           abs(delta) > config.rotateAngleThreshold,
-           separation > config.rotateMinSeparation {
-            return .rotate
-        }
-        if centDelta > 0 {
-            return .scroll
-        }
-        return .none
     }
 
     // MARK: - Helpers
@@ -633,32 +548,23 @@ final class TouchGestureRecognizer {
         if pinchActive {
             emit(.magnify(amount: 0, phase: .ended))
         }
-        if rotateActive {
-            emit(.rotate(degrees: 0, phase: .ended))
-        }
         resetMultiGestureState(finalize: false)
     }
 
     private func resetPairBaselines() {
         prevPairDistance = nil
-        prevPairAngle = nil
         scrollPrevCentroid = nil
         pairStartCentroid = nil
         pairStartDistance = nil
-        pairStartAngle = nil
     }
 
     private func resetMultiGestureState(finalize: Bool) {
         _ = finalize
         prevPairDistance = nil
-        prevPairAngle = nil
         scrollPrevCentroid = nil
         pairStartCentroid = nil
         pairStartDistance = nil
-        pairStartAngle = nil
         pinchActive = false
-        rotateActive = false
         scrollPhaseActive = false
-        lockedGesture = nil
     }
 }

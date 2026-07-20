@@ -13,8 +13,6 @@ final class TouchGestureRecognizerTests: XCTestCase {
         recognizer = TouchGestureRecognizer(
             config: TouchGestureConfig(
                 pinchDistanceThreshold: 1.5,
-                rotateMinSeparation: 80,
-                rotateAngleThreshold: 0.01,
                 gestureSettleDefer: 0.045
             ),
             sink: sink
@@ -181,6 +179,65 @@ final class TouchGestureRecognizerTests: XCTestCase {
         XCTAssertTrue(sink.effects.contains(.magnify(amount: 0, phase: .began)))
         XCTAssertTrue(sink.effects.contains { effect in
             if case .magnify(let amount, .changed) = effect { return amount > 0 }
+            return false
+        })
+    }
+
+    func testPanWithSeparationJitterDoesNotMagnify() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.4, y: 0.4),
+            contact(id: 2, phase: .began, x: 0.6, y: 0.4),
+        ], ts: 0)
+
+        sink.reset()
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.395, y: 0.5),
+            contact(id: 2, phase: .moved, x: 0.605, y: 0.5),
+        ], ts: 0.05)
+
+        XCTAssertTrue(sink.effects.contains { effect in
+            if case .scroll(_, _, let phase) = effect {
+                return phase == .began || phase == .changed
+            }
+            return false
+        })
+        XCTAssertFalse(sink.effects.contains { effect in
+            if case .magnify = effect { return true }
+            return false
+        })
+    }
+
+    func testCombinedPanAndPinchEmitsBoth() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.35, y: 0.4),
+            contact(id: 2, phase: .began, x: 0.65, y: 0.4),
+        ], ts: 0)
+
+        sink.reset()
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.30, y: 0.5),
+            contact(id: 2, phase: .moved, x: 0.70, y: 0.5),
+        ], ts: 0.05)
+
+        let magnifyIndices = sink.effects.enumerated().compactMap { index, effect -> Int? in
+            if case .magnify = effect { return index }
+            return nil
+        }
+        let scrollIndices = sink.effects.enumerated().compactMap { index, effect -> Int? in
+            if case .scroll = effect { return index }
+            return nil
+        }
+
+        XCTAssertFalse(magnifyIndices.isEmpty)
+        XCTAssertFalse(scrollIndices.isEmpty)
+        XCTAssertLessThan(magnifyIndices.max()!, scrollIndices.min()!)
+
+        XCTAssertTrue(sink.effects.contains { effect in
+            if case .magnify(_, .changed) = effect { return true }
+            return false
+        })
+        XCTAssertTrue(sink.effects.contains { effect in
+            if case .scroll(_, _, .changed) = effect { return true }
             return false
         })
     }
