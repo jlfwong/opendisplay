@@ -12,7 +12,6 @@ final class TouchGestureRecognizerTests: XCTestCase {
         sink = RecordingTouchGestureSink()
         recognizer = TouchGestureRecognizer(
             config: TouchGestureConfig(
-                scrollGain: 2.8,
                 pinchDistanceThreshold: 1.5,
                 rotateMinSeparation: 80,
                 rotateAngleThreshold: 0.01,
@@ -147,13 +146,14 @@ final class TouchGestureRecognizerTests: XCTestCase {
             }
             return false
         })
-        // Fingers moved down (+y) — scroll dy should be positive (natural direction).
-        XCTAssertTrue(scrollEffects.contains { effect in
-            if case .scroll(_, let dy, let phase) = effect, phase == .changed {
-                return dy > 0
-            }
-            return false
-        })
+        // Fingers moved down (+y) — scroll dy should match display-point travel (1:1).
+        let changedScroll = scrollEffects.compactMap { effect -> (Double, Double)? in
+            if case .scroll(let dx, let dy, let phase) = effect, phase == .changed { return (dx, dy) }
+            return nil
+        }
+        XCTAssertFalse(changedScroll.isEmpty)
+        XCTAssertEqual(changedScroll[0].0, 0, accuracy: 0.001)
+        XCTAssertEqual(changedScroll[0].1, 80, accuracy: 0.001)
 
         sink.reset()
         process(contacts: [

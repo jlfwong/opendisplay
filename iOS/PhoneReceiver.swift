@@ -671,38 +671,6 @@ final class PhoneReceiver: ObservableObject {
         return "moved"
     }
 
-    /// Touch events: x/y normalized [0,1] in video space, origin top-left.
-    /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
-    /// measure touch→injection latency without doing its own clock sync.
-    func sendTouch(phase: String, x: Double, y: Double,
-                    osMs: Double, captureMs: Double) {
-        let devMs = nowMs
-        let macMs = clockOffsetMs.map { devMs + $0 }
-        var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y,
-                                  "tDev": devMs]
-        if let macMs { msg["t"] = macMs }
-        queue.async {
-            let queueMs = self.nowMs
-            var inpId: Int?
-            var traceThis = false
-            if self.shouldTraceInput(phase: phase) {
-                inpId = IPadTrace.nextInputId()
-                traceThis = true
-                msg["inpId"] = inpId
-            }
-            if phase == "began" || phase == "moved", let macMs {
-                self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
-                if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
-            }
-            self.sendControl(msg, stampWire: inpId != nil) {
-                guard traceThis, let inpId else { return }
-                IPadTrace.recordInput(inputId: inpId, phase: phase,
-                                      osMs: osMs, captureMs: captureMs,
-                                      queueMs: queueMs, sendMs: self.nowMs)
-            }
-        }
-    }
-
     func sendPencil(phase: PencilPhase, x: Double, y: Double,
                     pressure: Double, azimuth: Double, altitude: Double,
                     rotation: Double, osMs: Double, captureMs: Double) {
@@ -759,29 +727,8 @@ final class PhoneReceiver: ObservableObject {
         sendControl(["type": WireInput.proximity, "entering": entering, "eraser": eraser])
     }
 
-    func sendGesture(kind: GestureKind, state: GestureState,
-                     scale: Double? = nil, velocity: Double? = nil,
-                     x: Double? = nil, y: Double? = nil, fingerCount: Int? = nil) {
-        var msg: [String: Any] = [
-            "type": WireInput.gesture,
-            "kind": kind.rawValue,
-            "state": state.rawValue,
-        ]
-        if let scale { msg["scale"] = scale }
-        if let velocity { msg["velocity"] = velocity }
-        if let x { msg["x"] = x }
-        if let y { msg["y"] = y }
-        if let fingerCount { msg["fingerCount"] = fingerCount }
-        sendControl(msg)
-    }
-
     func sendBarrelButton(down: Bool, x: Double, y: Double) {
         sendControl(["type": WireInput.barrelButton, "down": down, "x": x, "y": y])
-    }
-
-    /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
-    func sendScroll(dx: Double, dy: Double) {
-        sendControl(["type": "scroll", "dx": dx, "dy": dy])
     }
 
     /// Match each pen sample to the first frame captured on the Mac after it.

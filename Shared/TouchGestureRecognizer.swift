@@ -60,7 +60,6 @@ final class RecordingTouchGestureSink: TouchGestureSink {
 // MARK: - Configuration
 
 struct TouchGestureConfig: Equatable {
-    var scrollGain: Double = 2.8
     /// Minimum inter-finger distance change (display points) to start pinch.
     var pinchDistanceThreshold: Double = 1.5
     /// Minimum finger separation (display points) before rotation is considered.
@@ -525,8 +524,8 @@ final class TouchGestureRecognizer {
                 }
             case .scroll:
                 if let prev = scrollPrevCentroid {
-                    let dxRaw = (centroidX - prev.x) * displayWidth * config.scrollGain
-                    let dyRaw = (centroidY - prev.y) * displayHeight * config.scrollGain
+                    let dxRaw = (centroidX - prev.x) * displayWidth
+                    let dyRaw = (centroidY - prev.y) * displayHeight
                     if dxRaw != 0 || dyRaw != 0 {
                         if !scrollPhaseActive {
                             emit(.scroll(dx: 0, dy: 0, phase: .began))

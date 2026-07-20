@@ -60,29 +60,17 @@ final class InputInjector {
         switch type {
         case WireInput.touches:
             handleTouches(obj)
-        case "touch":
-            if let phase = obj["phase"] as? String,
-               let x = obj["x"] as? Double,
-               let y = obj["y"] as? Double {
-                handleTouch(phase: phase, x: x, y: y)
-            }
         case WireInput.pencil:
             handlePencil(obj)
         case WireInput.proximity:
             if let entering = obj["entering"] as? Bool {
                 handleProximity(entering: entering, eraser: obj["eraser"] as? Bool ?? false)
             }
-        case WireInput.gesture:
-            handleGesture(obj)
         case WireInput.barrelButton:
             if let down = obj["down"] as? Bool {
                 handleBarrelButton(down: down,
                                    x: obj["x"] as? Double,
                                    y: obj["y"] as? Double)
-            }
-        case "scroll":
-            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                handleScroll(dx: dx, dy: dy)
             }
         default:
             break
@@ -240,75 +228,12 @@ final class InputInjector {
         }
     }
 
-    // MARK: - Touch (single-finger mouse, legacy wire)
-
-    func handleTouch(phase: String, x: Double, y: Double) {
-        let p = screenPoint(nx: x, ny: y)
-        let type: CGEventType
-        switch phase {
-        case "began":
-            type = .leftMouseDown
-            fingerDown = true
-            logState("finger began @ \(fmt(p))")
-        case "moved":
-            type = fingerDown ? .leftMouseDragged : .mouseMoved
-        case "ended", "cancelled":
-            guard fingerDown else {
-                logState("finger \(phase) IGNORED (not down) @ \(fmt(p))")
-                return
-            }
-            type = .leftMouseUp
-            fingerDown = false
-            logState("finger \(phase) @ \(fmt(p))")
-        default:
-            logState("finger unknown phase \(phase)")
-            return
-        }
-        postMouse(type: type, at: p, button: .left)
-        markInjected()
-    }
-
-    // MARK: - Gestures
-
-    private func handleGesture(_ obj: [String: Any]) {
-        guard let kindStr = obj["kind"] as? String,
-              let kind = GestureKind(rawValue: kindStr),
-              let stateStr = obj["state"] as? String,
-              let state = GestureState(rawValue: stateStr) else { return }
-
-        switch kind {
-        case .tap:
-            handleTapGesture(state: state, fingerCount: obj["fingerCount"] as? Int)
-        case .pinch:
-            logState("pinch gesture ignored (disabled)")
-        case .rotate, .pan, .longPress, .swipe:
-            break
-        }
-    }
-
-    private func handleTapGesture(state: GestureState, fingerCount: Int?) {
-        guard state == .ended else { return }
-        switch fingerCount {
-        case 2:
-            logState("gesture undo (Cmd+Z)")
-            postKeyCommand(keyCode: 0x06, flags: .command)
-        case 3:
-            logState("gesture redo (Cmd+Shift+Z)")
-            postKeyCommand(keyCode: 0x06, flags: [.command, .shift])
-        default:
-            break
-        }
-    }
-
     private func handleBarrelButton(down: Bool, x: Double?, y: Double?) {
         logState("barrelButton down=\(down) x=\(x ?? -1) y=\(y ?? -1)")
         postRightClick(down: down, x: x, y: y)
     }
 
-    /// dx/dy in display pixels, natural-scrolling sign from the phone.
-    func handleScroll(dx: Double, dy: Double) {
-        postScrollPhased(dx: dx, dy: dy, phase: .changed)
-    }
+    // MARK: - CGEvent posting (gestures + scroll)
 
     private enum GestureEventField: Int {
         case subtype = 110
@@ -377,19 +302,17 @@ final class InputInjector {
         }
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
                                   wheelCount: 2,
-                                  wheel1: Int32(dy.rounded()),
-                                  wheel2: Int32(dx.rounded()),
+                                  wheel1: 0,
+                                  wheel2: 0,
                                   wheel3: 0) else { return }
         event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(scrollPhase.rawValue))
-        let fixed1 = Int64((dy * 65536.0).rounded())
-        let fixed2 = Int64((dx * 65536.0).rounded())
-        if let axis1 = CGEventField(rawValue: 93) { event.setIntegerValueField(axis1, value: fixed1) }
-        if let axis2 = CGEventField(rawValue: 94) { event.setIntegerValueField(axis2, value: fixed2) }
+        event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(dy.rounded()))
+        event.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(dx.rounded()))
         event.post(tap: .cghidEventTap)
     }
 
-    // MARK: - CGEvent posting
+    // MARK: - CGEvent posting (mouse + tablet)
 
     private enum PointPhase { case down, drag, up, hover }
 
@@ -495,13 +418,6 @@ final class InputInjector {
                     Log.info("[input] recv touches \(wirePhase) n=\(contacts.count) | \(stateLine())")
                 }
             }
-        case "touch":
-            if let phase = obj["phase"] as? String,
-               let x = obj["x"] as? Double, let y = obj["y"] as? Double {
-                if phase != "moved" {
-                    Log.info("[input] recv touch \(phase) @ \(fmtPt(x, y)) | \(stateLine())")
-                }
-            }
         case WireInput.pencil:
             let phase = obj["phase"] as? String ?? "?"
             if phase != "move" && phase != "hover" {
@@ -511,8 +427,6 @@ final class InputInjector {
             }
         case WireInput.proximity:
             Log.info("[input] recv proximity entering=\(obj["entering"] ?? "?") eraser=\(obj["eraser"] ?? "?") | \(stateLine())")
-        case WireInput.gesture:
-            Log.info("[input] recv gesture \(obj["kind"] ?? "?") \(obj["state"] ?? "?") fingers=\(obj["fingerCount"] ?? "-") | \(stateLine())")
         case WireInput.barrelButton:
             Log.info("[input] recv barrelButton down=\(obj["down"] ?? "?") | \(stateLine())")
         default:
