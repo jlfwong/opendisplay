@@ -16,6 +16,9 @@ schemes:
     build:
       targets:
         OpenSidecarMac: all
+    test:
+      targets:
+        - OpenSidecarMacTests
   OpenSidecariOS:
     build:
       targets:
@@ -84,6 +87,18 @@ targets:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.debug
           BUNDLE_DISPLAY_NAME: OpenDisplay Dev
+  OpenSidecarMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - Tests/OpenSidecarMacTests
+      - Shared
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.tests
+        SWIFT_VERSION: "5.9"
   OpenSidecariOS:
     type: application
     platform: iOS

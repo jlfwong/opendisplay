@@ -14,7 +14,7 @@ enum Log {
     static func info(_ message: String) {
         let line = "[\(formatter.string(from: Date()))] \(message)\n"
         print(line, terminator: "")
-        queue.async {
+        queue.sync {
             if let handle = FileHandle(forWritingAtPath: path) {
                 handle.seekToEndOfFile()
                 handle.write(line.data(using: .utf8)!)

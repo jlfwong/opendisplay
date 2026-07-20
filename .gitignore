@@ -26,6 +26,7 @@ newnewicon.png
 # Local developer config (signing team etc.)
 .env
 .claude/
+.cursor/
 
 # Fastlane generated output
 fastlane/report.xml
@@ -38,3 +39,9 @@ fastlane/test_output/
 node_modules/
 dist-ssr/
 docs/
+
+# Local performance traces (Perfetto exports, session metadata)
+traces/
+*.perfetto.json
+*.session.json
+opendisplay-trace-*.perfetto.json

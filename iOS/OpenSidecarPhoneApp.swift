@@ -42,8 +42,8 @@ struct ReceiverScreen: View {
     @State private var showOnboarding = false
     @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
     @AppStorage("hasConnectedBefore") private var hasConnectedBefore = false
@@ -71,21 +71,31 @@ struct ReceiverScreen: View {
         GeometryReader { geo in
             ZStack {
                 if isStreaming {
-                    Color.black.ignoresSafeArea()
-                    VideoLayerView(displayLayer: model.receiver.displayLayer,
-                                   receiver: model.receiver,
-                                   useMetal: metalRenderer)
-                        .id(metalRenderer)   // rebuild the layer tree on toggle
-                        .ignoresSafeArea()
-                    if showAnalytics {
-                        VStack {
-                            Spacer()
-                            PerfOverlay(stats: model.receiver.perf,
-                                        videoSize: model.receiver.videoSize)
-                                .padding(.bottom, 10)
+                    HStack(spacing: 0) {
+                        SidebarView(width: PhoneReceiver.sidebarWidthPoints) { keyCode, down in
+                            if model.receiver.connected || !down {
+                                model.receiver.sendKey(keyCode: keyCode, down: down)
+                            }
                         }
-                        .allowsHitTesting(false)   // never block touch input
+                        ZStack {
+                            VideoLayerView(displayLayer: model.receiver.displayLayer,
+                                           receiver: model.receiver,
+                                           useMetal: metalRenderer)
+                                .id(metalRenderer)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            VStack {
+                                Spacer()
+                                if showPerfOverlay {
+                                    PerfOverlay(stats: model.receiver.perf,
+                                                videoSize: model.receiver.videoSize)
+                                        .padding(.bottom, 10)
+                                }
+                            }
+                            .allowsHitTesting(false)
+                        }
                     }
+                    .background(Color.black)
+                    .ignoresSafeArea()
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
@@ -315,9 +325,17 @@ struct PerfOverlay: View {
                     metric("photon", String(format: "%.0f ms", stats.photonP50))
                 }
                 if stats.inputP50 > 0 {
-                    // touch→CGEvent on the Mac; full touch-to-photon adds
-                    // the render+capture wait and one e2e on top.
                     metric("input", String(format: "%.0f ms", stats.inputP50))
+                }
+                if stats.macPaintP50 > 0 {
+                    metric("paint", String(format: "%.0f ms", stats.macPaintP50))
+                }
+                if stats.strokeP50 > 0 {
+                    metric("stroke", String(format: "%.0f ms", stats.strokeP50))
+                    metric("str p95", String(format: "%.0f ms", stats.strokeP95))
+                }
+                if stats.strokePhotonP50 > 0 {
+                    metric("stroke∅", String(format: "%.0f ms", stats.strokePhotonP50))
                 }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
                 metric("FPS", "\(stats.fps)")
@@ -326,7 +344,8 @@ struct PerfOverlay: View {
                 }
                 metric("Mbit/s", String(format: "%.1f", stats.mbps))
                 metric("stalls", "\(stats.stalls)")
-                metric("drops", "\(stats.macDrops)")
+                metric("enc↓", "\(stats.macEncDrops)")
+                metric("net↓", "\(stats.macNetDrops)")
                 if stats.macPending > 0 {
                     metric("queue", "\(stats.macPending)")
                 }
@@ -350,12 +369,18 @@ struct PerfOverlay: View {
 
     @ViewBuilder
     private var graphs: some View {
-        graph("latency ms (cap→display)",
+        graph("cap→display ms",
               BarGraph(samples: stats.e2eSamples, ceiling: 80,
                        good: 25, warn: 40, reference: nil))
-        graph("frame interval ms",
-              BarGraph(samples: stats.samples, ceiling: 60,
-                       good: 25, warn: 50, reference: 16.7))
+        if !stats.strokeSamples.isEmpty {
+            graph("pen→display ms",
+                  BarGraph(samples: stats.strokeSamples, ceiling: 120,
+                           good: 16, warn: 32, reference: 16.7))
+        } else {
+            graph("frame interval ms",
+                  BarGraph(samples: stats.samples, ceiling: 60,
+                           good: 25, warn: 50, reference: 16.7))
+        }
     }
 
     private func metric(_ label: String, _ value: String) -> some View {
@@ -461,8 +486,9 @@ struct BarGraph: View {
 struct SettingsView: View {
     @ObservedObject var receiver: PhoneReceiver
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("showPerfOverlay") private var showPerfOverlay = false
+    @AppStorage(LatencyTelemetry.detailedLogKey) private var latencyLog = false
 
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -495,12 +521,13 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("Performance overlay", isOn: $showAnalytics)
+                    Toggle("Performance overlay", isOn: $showPerfOverlay)
                     Toggle("Metal renderer (experimental)", isOn: $metalRenderer)
+                    Toggle("Latency detail log", isOn: $latencyLog)
                 } header: {
                     Text("Analytics")
                 } footer: {
-                    Text("The overlay shows FPS, bitrate, frame timing, stalls, and latency graphs at the bottom of the screen while streaming. The experimental Metal renderer decodes and presents frames manually — it adds decode and true on-glass latency metrics to the overlay, but in our measurements the system video layer displays frames faster. Leave it off unless you're debugging.")
+                    Text("Overlay shows transport (USB/WiFi), FPS, bitrate, and latency breakdown. stroke = pen on glass → iPad display (target under 16 ms). input = pen → Mac; paint = inject → capture; latency = capture → display. Detail log writes [latency] lines to the device log.")
                 }
 
                 Section {
@@ -522,7 +549,7 @@ struct SettingsView: View {
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rectangle.portrait.rotate")
-                    Label("Touch: tap to click, drag to drag, two-finger pan to scroll.",
+                    Label("Touch: one finger to click/drag; two/three-finger tap for undo/redo. Apple Pencil draws with pressure and tilt; hover moves the cursor.",
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
@@ -635,10 +662,23 @@ struct VideoLayerView: UIViewRepresentable {
             view.layer.addSublayer(displayLayer)
         }
 
-        let pan = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
-        pan.minimumNumberOfTouches = 2
-        pan.maximumNumberOfTouches = 2
-        view.addGestureRecognizer(pan)
+        view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
+        view.inputEngine.onTouches = { [weak receiver] contacts, osMs, captureMs in
+            receiver?.sendTouches(contacts: contacts, osMs: osMs, captureMs: captureMs)
+        }
+        view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation, osMs, captureMs in
+            receiver?.sendPencil(phase: phase, x: x, y: y,
+                                 pressure: pressure, azimuth: azimuth,
+                                 altitude: altitude, rotation: rotation,
+                                 osMs: osMs, captureMs: captureMs)
+        }
+        view.inputEngine.onProximity = { [weak receiver] entering, eraser in
+            receiver?.sendProximity(entering: entering, eraser: eraser)
+        }
+        view.inputEngine.onBarrelButton = { [weak receiver] down, x, y in
+            receiver?.sendBarrelButton(down: down, x: x, y: y)
+        }
+        view.inputEngine.install(on: view)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -659,6 +699,7 @@ struct VideoLayerView: UIViewRepresentable {
     final class VideoView: UIView {
         weak var receiver: PhoneReceiver?
         var metalRenderer: MetalVideoRenderer?
+        let inputEngine = InputCaptureEngine()
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -744,77 +785,32 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         // The video is aspect-fit inside the view; map view coords into the
-        // displayed video rect and normalize to [0,1].
-        private func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
-            guard let video = receiver?.videoSize, video != .zero,
-                  bounds.width > 0, bounds.height > 0 else { return nil }
-            let scale = min(bounds.width / video.width, bounds.height / video.height)
-            let size = CGSize(width: video.width * scale, height: video.height * scale)
-            let origin = CGPoint(x: (bounds.width - size.width) / 2,
-                                 y: (bounds.height - size.height) / 2)
-            let x = (point.x - origin.x) / size.width
-            let y = (point.y - origin.y) / size.height
-            return (min(max(x, 0), 1), min(max(y, 0), 1))
+        // displayed video rect and normalize to [0,1]. Reject points outside
+        // the rect — do not clamp (sidebar fingers leak into allTouches with
+        // negative x and would otherwise snap to the left edge).
+        fileprivate func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
+            guard let rect = videoRect() else { return nil }
+            guard rect.contains(point) else { return nil }
+            let x = Double((point.x - rect.minX) / rect.width)
+            let y = Double((point.y - rect.minY) / rect.height)
+            return (x, y)
         }
 
-        private var twoFingerActive = false
-        private var lastPan = CGPoint.zero
-        private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
-
-        @objc func didTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-            guard let video = receiver?.videoSize, video != .zero else { return }
-            switch recognizer.state {
-            case .began:
-                twoFingerActive = true
-                lastPan = .zero
-            case .changed:
-                let t = recognizer.translation(in: self)
-                let scale = min(bounds.width / video.width, bounds.height / video.height)
-                // Deltas in video pixels, natural-scrolling direction.
-                receiver?.sendScroll(dx: (t.x - lastPan.x) / scale,
-                                     dy: (t.y - lastPan.y) / scale)
-                lastPan = t
-            default:
-                twoFingerActive = false
-            }
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "began", ended: false, osDeliveredMs: osMs)
         }
-
-        private func send(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
-            // Ignore single-finger events while a two-finger gesture runs,
-            // and end the click if a second finger joins mid-press.
-            if twoFingerActive || (event?.allTouches?.count ?? 1) > 1 {
-                if phase != "began" {
-                    receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
-                }
-                return
-            }
-            guard let touch = touches.first,
-                  let norm = normalized(touch.location(in: self)) else { return }
-            lastNorm = norm
-            if phase == "moved", let event {
-                // The panel samples touches at 120Hz but UIKit delivers at
-                // display refresh — forward every coalesced sample so the Mac
-                // gets the full-rate drag, then UIKit's predicted touch so the
-                // cursor leads toward where the finger will be (~1 frame of
-                // perceived latency back; corrected by the next real sample).
-                for t in event.coalescedTouches(for: touch) ?? [touch] {
-                    if let n = normalized(t.location(in: self)) {
-                        lastNorm = n
-                        receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
-                    }
-                }
-                if let predicted = event.predictedTouches(for: touch)?.last,
-                   let n = normalized(predicted.location(in: self)) {
-                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
-                }
-                return
-            }
-            receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "moved", ended: false, osDeliveredMs: osMs)
         }
-
-        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { send("began", touches, event) }
-        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { send("moved", touches, event) }
-        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { send("ended", touches, event) }
-        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send("cancelled", touches, event) }
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "ended", ended: true, osDeliveredMs: osMs)
+        }
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "cancelled", ended: true, osDeliveredMs: osMs)
+        }
     }
 }
