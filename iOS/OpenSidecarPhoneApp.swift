@@ -71,21 +71,27 @@ struct ReceiverScreen: View {
         GeometryReader { geo in
             ZStack {
                 if isStreaming {
-                    Color.black.ignoresSafeArea()
-                    VideoLayerView(displayLayer: model.receiver.displayLayer,
-                                   receiver: model.receiver,
-                                   useMetal: metalRenderer)
-                        .id(metalRenderer)   // rebuild the layer tree on toggle
-                        .ignoresSafeArea()
-                    VStack {
-                        Spacer()
-                        if showPerfOverlay {
-                            PerfOverlay(stats: model.receiver.perf,
-                                        videoSize: model.receiver.videoSize)
-                                .padding(.bottom, 10)
+                    HStack(spacing: 0) {
+                        SidebarView(width: PhoneReceiver.sidebarWidthPoints)
+                        ZStack {
+                            VideoLayerView(displayLayer: model.receiver.displayLayer,
+                                           receiver: model.receiver,
+                                           useMetal: metalRenderer)
+                                .id(metalRenderer)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            VStack {
+                                Spacer()
+                                if showPerfOverlay {
+                                    PerfOverlay(stats: model.receiver.perf,
+                                                videoSize: model.receiver.videoSize)
+                                        .padding(.bottom, 10)
+                                }
+                            }
+                            .allowsHitTesting(false)
                         }
                     }
-                    .allowsHitTesting(false)
+                    .background(Color.black)
+                    .ignoresSafeArea()
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
@@ -772,17 +778,15 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         // The video is aspect-fit inside the view; map view coords into the
-        // displayed video rect and normalize to [0,1].
+        // displayed video rect and normalize to [0,1]. Reject points outside
+        // the rect — do not clamp (sidebar fingers leak into allTouches with
+        // negative x and would otherwise snap to the left edge).
         fileprivate func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
-            guard let video = receiver?.videoSize, video != .zero,
-                  bounds.width > 0, bounds.height > 0 else { return nil }
-            let scale = min(bounds.width / video.width, bounds.height / video.height)
-            let size = CGSize(width: video.width * scale, height: video.height * scale)
-            let origin = CGPoint(x: (bounds.width - size.width) / 2,
-                                 y: (bounds.height - size.height) / 2)
-            let x = (point.x - origin.x) / size.width
-            let y = (point.y - origin.y) / size.height
-            return (min(max(x, 0), 1), min(max(y, 0), 1))
+            guard let rect = videoRect() else { return nil }
+            guard rect.contains(point) else { return nil }
+            let x = Double((point.x - rect.minX) / rect.width)
+            let y = Double((point.y - rect.minY) / rect.height)
+            return (x, y)
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {

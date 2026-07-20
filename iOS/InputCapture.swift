@@ -23,6 +23,9 @@ final class InputCaptureEngine: NSObject {
     private let tapMoveThreshold: CGFloat = 8
     private var touchIds: [ObjectIdentifier: Int] = [:]
     private var nextTouchId = 1
+    /// Finger touches that began on the host view — excludes sidebar/rest-of-window
+    /// contacts that UIKit still lists in event.allTouches during pencil moves.
+    private var hostFingerTouches: Set<ObjectIdentifier> = []
 
     private struct PenStroke {
         var start: CGPoint
@@ -107,8 +110,16 @@ final class InputCaptureEngine: NSObject {
                 osDeliveredMs: Double) {
         guard let view = hostView else { return }
 
+        if phase == "began" {
+            for touch in touches where isFinger(touch) {
+                hostFingerTouches.insert(ObjectIdentifier(touch))
+            }
+        }
+
         var fingerContacts: [WireTouchContact] = []
-        let allFingerTouches = (event?.allTouches ?? touches).filter { isFinger($0) }
+        let allFingerTouches = (event?.allTouches ?? touches).filter {
+            isFinger($0) && hostFingerTouches.contains(ObjectIdentifier($0))
+        }
 
         for touch in allFingerTouches {
             let contactPhase: TouchContactPhase
@@ -144,6 +155,7 @@ final class InputCaptureEngine: NSObject {
 
             if contactPhase == .ended || contactPhase == .cancelled {
                 releaseTouchId(touch)
+                hostFingerTouches.remove(ObjectIdentifier(touch))
             }
         }
 
