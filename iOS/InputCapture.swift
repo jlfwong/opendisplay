@@ -27,6 +27,7 @@ final class InputCaptureEngine: NSObject {
     private struct PenStroke {
         var start: CGPoint
         var sentDown: Bool
+        var proximitySent: Bool
     }
 
     func install(on view: UIView) {
@@ -192,8 +193,7 @@ final class InputCaptureEngine: NSObject {
 
         if !ended && !activePens.contains(id) {
             activePens.insert(id)
-            onProximity?(true, false)
-            penStrokes[id] = PenStroke(start: loc, sentDown: false)
+            penStrokes[id] = PenStroke(start: loc, sentDown: false, proximitySent: false)
             logCapture("pen contact began (waiting for move/tap)")
             return
         }
@@ -206,6 +206,10 @@ final class InputCaptureEngine: NSObject {
             if !stroke.sentDown {
                 guard moved > tapMoveThreshold else { return }
                 stroke.sentDown = true
+                if !stroke.proximitySent {
+                    onProximity?(true, false)
+                    stroke.proximitySent = true
+                }
                 penStrokes[id] = stroke
                 if let (sx, sy) = norm(stroke.start) {
                     logCapture("pen stroke down @ \(fmt(sx, sy))")
@@ -226,8 +230,10 @@ final class InputCaptureEngine: NSObject {
 
         defer {
             activePens.remove(id)
+            if let stroke = penStrokes[id], stroke.proximitySent {
+                onProximity?(false, false)
+            }
             penStrokes.removeValue(forKey: id)
-            onProximity?(false, false)
         }
 
         if let stroke = penStrokes[id], !stroke.sentDown {

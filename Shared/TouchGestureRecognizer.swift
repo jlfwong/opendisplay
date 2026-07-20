@@ -17,6 +17,8 @@ enum TouchGestureEffect: Equatable {
     case magnify(amount: Double, phase: TouchGesturePhase)
     case rotate(degrees: Double, phase: TouchGesturePhase)
     case scroll(dx: Double, dy: Double, phase: TouchGesturePhase)
+    case undo
+    case redo
 }
 
 // MARK: - Input frame
@@ -65,6 +67,18 @@ struct TouchGestureConfig: Equatable {
     var rotateMinSeparation: Double = 80
     /// Minimum angle delta (radians) per frame for rotation.
     var rotateAngleThreshold: Double = 0.01
+    // Deadbands: cumulative movement a two-finger touch must travel before it's
+    // read as a manipulation. Larger values keep a two-finger *tap* from being
+    // mistaken for a pan/pinch, so tap → undo stays reliable.
+    /// Centroid travel (display points) before two-finger pan begins.
+    var panStartThreshold: Double = 10
+    /// Finger-separation change (display points) before pinch begins.
+    var pinchStartThreshold: Double = 10
+    /// Rotation (radians) before rotate begins.
+    var rotateStartThreshold: Double = 0.18
+    /// A two/three-finger touch that lifts within this window — without ever
+    /// crossing a manipulation deadband — is a tap (undo / redo).
+    var tapMaxDuration: TimeInterval = 0.35
 }
 
 // MARK: - Recognizer
@@ -98,6 +112,17 @@ final class TouchGestureRecognizer {
     private var scrollPhaseActive = false
     private var lockedGesture: ActiveGesture?
 
+    // Reference values captured when the current finger pair is first seen —
+    // used to measure cumulative travel against the deadbands.
+    private var pairStartCentroid: (x: Double, y: Double)?
+    private var pairStartDistance: Double?
+    private var pairStartAngle: Double?
+
+    // Whole-interaction (first finger down → last finger up) tracking for taps.
+    private var interactionStart: TimeInterval?
+    private var interactionPeakFingers = 0
+    private var interactionManipulated = false
+
     init(config: TouchGestureConfig, sink: TouchGestureSink) {
         self.config = config
         self.sink = sink
@@ -108,6 +133,9 @@ final class TouchGestureRecognizer {
         lastTimestamp = nil
         leftDown = false
         suppressSinglePress = false
+        interactionStart = nil
+        interactionPeakFingers = 0
+        interactionManipulated = false
         resetMultiGestureState(finalize: true)
     }
 
@@ -129,12 +157,40 @@ final class TouchGestureRecognizer {
 
         let prevActiveCount = activeContactCount()
 
+        // A new `.began` for an id we weren't tracking means a fresh touch
+        // sequence — purge stale contacts that would otherwise make this look
+        // like a two-finger gesture (the #1 cause of single-finger taps doing
+        // nothing: pressLeft never fires, only warpCursor / scroll / magnify).
+        for contact in frame.contacts where contact.phase == .began {
+            guard tracked[contact.id] == nil, !tracked.isEmpty else { continue }
+            if leftDown, let t = tracked.values.first {
+                emit(.releaseLeft(x: t.lastX, y: t.lastY))
+            }
+            leftDown = false
+            tracked.removeAll()
+            suppressSinglePress = false
+            resetMultiGestureState(finalize: false)
+            interactionManipulated = false
+        }
+
+        // Start of a fresh touch sequence: clear any state a previous (possibly
+        // messy) interaction left behind, so a plain single-finger tap always
+        // begins clean instead of inheriting a stuck `suppressSinglePress`.
+        if prevActiveCount == 0 && frame.contacts.contains(where: { $0.phase == .began }) {
+            suppressSinglePress = false
+            resetMultiGestureState(finalize: false)
+            interactionStart = now
+            interactionPeakFingers = 0
+            interactionManipulated = false
+        }
+
         for contact in frame.contacts where contact.phase == .began {
             tracked[contact.id] = TrackedTouch(id: contact.id, lastX: contact.x, lastY: contact.y)
         }
 
         let active = activeContacts(from: frame.contacts)
         let fingerCount = active.count
+        interactionPeakFingers = max(interactionPeakFingers, fingerCount)
 
         if prevActiveCount == 1 && fingerCount >= 2 {
             retractSinglePress(emit: emit)
@@ -153,7 +209,11 @@ final class TouchGestureRecognizer {
                 emit(.releaseLeft(x: x, y: y))
                 leftDown = false
             }
+            emitTapIfNeeded(now: now, emit: emit)
             suppressSinglePress = false
+            interactionStart = nil
+            interactionPeakFingers = 0
+            interactionManipulated = false
         case 1:
             handleSingle(active[0], displayWidth: dw, displayHeight: dh, emit: emit)
             if fingerCount < prevActiveCount {
@@ -241,7 +301,24 @@ final class TouchGestureRecognizer {
 
         emit(.warpCursor(x: centroidX, y: centroidY))
 
-        if let prevDist = prevPairDistance {
+        if pairStartCentroid == nil { pairStartCentroid = (centroidX, centroidY) }
+        if pairStartDistance == nil { pairStartDistance = distance }
+        if pairStartAngle == nil { pairStartAngle = angle }
+
+        // Cumulative movement since the pair was first seen, measured against
+        // the deadbands so an incidental tap doesn't register as a manipulation.
+        let startCentroid = pairStartCentroid ?? (centroidX, centroidY)
+        let travel = hypot((centroidX - startCentroid.x) * displayWidth,
+                           (centroidY - startCentroid.y) * displayHeight)
+        let separationChange = abs(distance - (pairStartDistance ?? distance))
+        let rotationSoFar = abs(angle - (pairStartAngle ?? angle))
+        let deadbandCrossed = scrollPhaseActive || pinchActive || rotateActive
+            || travel > config.panStartThreshold
+            || separationChange > config.pinchStartThreshold
+            || (rotationSoFar > config.rotateStartThreshold && distance > config.rotateMinSeparation)
+
+        if deadbandCrossed, let prevDist = prevPairDistance {
+            interactionManipulated = true
             let distDelta = distance - prevDist
             let centDelta: Double
             if let prev = scrollPrevCentroid {
@@ -298,7 +375,8 @@ final class TouchGestureRecognizer {
                             scrollPhaseActive = true
                             lockedGesture = .scroll
                         }
-                        emit(.scroll(dx: -dxRaw, dy: dyRaw, phase: .changed))
+                        // Natural direction: content follows the fingers on both axes.
+                        emit(.scroll(dx: dxRaw, dy: -dyRaw, phase: .changed))
                     }
                 }
             case .none:
@@ -356,6 +434,19 @@ final class TouchGestureRecognizer {
         tracked.count
     }
 
+    /// A two/three-finger touch that lifted quickly without manipulating is a
+    /// tap: two fingers → undo, three fingers → redo.
+    private func emitTapIfNeeded(now: TimeInterval, emit: (TouchGestureEffect) -> Void) {
+        guard !interactionManipulated,
+              let start = interactionStart,
+              now - start <= config.tapMaxDuration else { return }
+        switch interactionPeakFingers {
+        case 2: emit(.undo)
+        case 3: emit(.redo)
+        default: break
+        }
+    }
+
     private func retractSinglePress(emit: (TouchGestureEffect) -> Void) {
         guard leftDown, let t = tracked.values.first else { return }
         emit(.releaseLeft(x: t.lastX, y: t.lastY))
@@ -382,6 +473,9 @@ final class TouchGestureRecognizer {
         prevPairDistance = nil
         prevPairAngle = nil
         scrollPrevCentroid = nil
+        pairStartCentroid = nil
+        pairStartDistance = nil
+        pairStartAngle = nil
         pinchActive = false
         rotateActive = false
         scrollPhaseActive = false

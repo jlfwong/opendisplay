@@ -816,7 +816,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard bounds.width > 0, bounds.height > 0 else { return }
         if bounds.contains(loc) {
             let x = (loc.x - bounds.minX) / bounds.width
-            let y = (loc.y - bounds.minY) / bounds.height
+            let y = (bounds.maxY - loc.y) / bounds.height
             if !lastCursorSent.visible
                 || abs(x - lastCursorSent.x) > 0.0004 || abs(y - lastCursorSent.y) > 0.0004 {
                 lastCursorSent = (x, y, true)

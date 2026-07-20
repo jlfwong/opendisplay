@@ -210,6 +210,12 @@ final class InputInjector {
             postRotate(degrees: degrees, phase: phase)
         case .scroll(let dx, let dy, let phase):
             postScrollPhased(dx: dx, dy: dy, phase: phase)
+        case .undo:
+            logState("two-finger tap → undo (Cmd+Z)")
+            postKeyCommand(keyCode: 0x06, flags: .command)
+        case .redo:
+            logState("three-finger tap → redo (Cmd+Shift+Z)")
+            postKeyCommand(keyCode: 0x06, flags: [.command, .shift])
         }
     }
 
@@ -451,10 +457,12 @@ final class InputInjector {
 
     // MARK: - Coordinate mapping
 
+    /// Map video-normalized coords (origin top-left) to global screen points
+    /// (origin bottom-left, per CoreGraphics).
     private func screenPoint(nx: Double, ny: Double) -> CGPoint {
         let bounds = CGDisplayBounds(displayID)
         return CGPoint(x: bounds.minX + nx * bounds.width,
-                       y: bounds.minY + ny * bounds.height)
+                       y: bounds.maxY - ny * bounds.height)
     }
 
     private func currentCursor() -> CGPoint {

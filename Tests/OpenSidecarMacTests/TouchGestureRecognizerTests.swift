@@ -156,6 +156,95 @@ final class TouchGestureRecognizerTests: XCTestCase {
         })
     }
 
+    // MARK: - Tap → undo / redo
+
+    func testTwoFingerTapEmitsUndo() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.4, y: 0.5),
+            contact(id: 2, phase: .began, x: 0.6, y: 0.5),
+        ], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .ended, x: 0.4, y: 0.5),
+            contact(id: 2, phase: .ended, x: 0.6, y: 0.5),
+        ], ts: 0.05)
+
+        XCTAssertTrue(sink.effects.contains(.undo))
+        XCTAssertFalse(sink.effects.contains(.redo))
+    }
+
+    func testThreeFingerTapEmitsRedo() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.3, y: 0.5),
+            contact(id: 2, phase: .began, x: 0.5, y: 0.5),
+            contact(id: 3, phase: .began, x: 0.7, y: 0.5),
+        ], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .ended, x: 0.3, y: 0.5),
+            contact(id: 2, phase: .ended, x: 0.5, y: 0.5),
+            contact(id: 3, phase: .ended, x: 0.7, y: 0.5),
+        ], ts: 0.05)
+
+        XCTAssertTrue(sink.effects.contains(.redo))
+        XCTAssertFalse(sink.effects.contains(.undo))
+    }
+
+    func testTwoFingerPanIsNotMistakenForTap() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.4, y: 0.4),
+            contact(id: 2, phase: .began, x: 0.6, y: 0.4),
+        ], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.4, y: 0.6),
+            contact(id: 2, phase: .moved, x: 0.6, y: 0.6),
+        ], ts: 0.05)
+        process(contacts: [
+            contact(id: 1, phase: .ended, x: 0.4, y: 0.6),
+            contact(id: 2, phase: .ended, x: 0.6, y: 0.6),
+        ], ts: 0.10)
+
+        XCTAssertFalse(sink.effects.contains(.undo))
+        XCTAssertFalse(sink.effects.contains(.redo))
+    }
+
+    func testSlowTwoFingerHoldIsNotUndo() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.4, y: 0.5),
+            contact(id: 2, phase: .began, x: 0.6, y: 0.5),
+        ], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .ended, x: 0.4, y: 0.5),
+            contact(id: 2, phase: .ended, x: 0.6, y: 0.5),
+        ], ts: 1.0)
+
+        XCTAssertFalse(sink.effects.contains(.undo))
+    }
+
+    // A fresh single-finger tap must work even after a multi-finger gesture
+    // left recognizer state behind (regression: single tap only warped cursor).
+    func testSingleFingerTapWorksAfterTwoFingerGesture() {
+        process(contacts: [
+            contact(id: 1, phase: .began, x: 0.4, y: 0.4),
+            contact(id: 2, phase: .began, x: 0.6, y: 0.4),
+        ], ts: 0)
+        process(contacts: [
+            contact(id: 1, phase: .moved, x: 0.4, y: 0.6),
+            contact(id: 2, phase: .moved, x: 0.6, y: 0.6),
+        ], ts: 0.05)
+        process(contacts: [
+            contact(id: 1, phase: .ended, x: 0.4, y: 0.6),
+            contact(id: 2, phase: .ended, x: 0.6, y: 0.6),
+        ], ts: 0.10)
+
+        sink.reset()
+        process(contacts: [contact(id: 3, phase: .began, x: 0.5, y: 0.5)], ts: 1.0)
+        process(contacts: [contact(id: 3, phase: .ended, x: 0.5, y: 0.5)], ts: 1.05)
+
+        XCTAssertEqual(sink.effects, [
+            .pressLeft(x: 0.5, y: 0.5),
+            .releaseLeft(x: 0.5, y: 0.5),
+        ])
+    }
+
     // MARK: - After gesture, remaining finger warps only
 
     func testRemainingFingerAfterTwoFingerGestureDoesNotPress() {
