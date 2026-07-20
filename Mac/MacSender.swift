@@ -1149,7 +1149,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case WireInput.touches, WireInput.pencil, WireInput.proximity,
-             WireInput.barrelButton:
+             WireInput.barrelButton, WireInput.key:
             logInputWire(obj)
             let inpId = obj["inpId"] as? Int
             let wireFallbackMs = obj["tSend"] as? Double

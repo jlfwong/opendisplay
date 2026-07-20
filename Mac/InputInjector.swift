@@ -27,6 +27,8 @@ final class InputInjector {
     private let touchSink: InputInjectorTouchSink
 
     private let deviceID: Int64 = 1
+    /// Modifier flags from sidebar hold-keys (Option, etc.) applied to pointer events.
+    private var heldModifiers: CGEventFlags = []
 
     init(displayID: CGDirectDisplayID) {
         self.displayID = displayID
@@ -71,6 +73,16 @@ final class InputInjector {
                 handleBarrelButton(down: down,
                                    x: obj["x"] as? Double,
                                    y: obj["y"] as? Double)
+            }
+        case WireInput.key:
+            if let keyCode = obj["keyCode"] as? Int {
+                let down = (obj["down"] as? Bool) ?? ((obj["down"] as? Int).map { $0 != 0 } ?? false)
+                if down {
+                    postKeyDown(keyCode: UInt16(keyCode))
+                } else {
+                    postKeyUp(keyCode: UInt16(keyCode))
+                }
+                markInjected()
             }
         default:
             break
@@ -278,7 +290,7 @@ final class InputInjector {
                                    value: hidPhase(phase))
         let value = phase == .changed ? amount : 0
         event.setDoubleValueField(gestureField(GestureEventField.value.rawValue), value: value)
-        event.flags = .maskNonCoalesced
+        event.flags = injectedEventFlags()
         event.post(tap: .cgSessionEventTap)
     }
 
@@ -345,7 +357,7 @@ final class InputInjector {
         if phase == .down || phase == .up {
             ev.setIntegerValueField(.mouseEventClickState, value: 1)
         }
-        ev.flags = .maskNonCoalesced
+        ev.flags = injectedEventFlags()
         if phase == .down || phase == .up {
             logPost("tablet \(phase) p=\(String(format: "%.2f", pressure))", at: p, button: .left,
                      subtype: "tabletPoint", flags: ev.flags)
@@ -357,8 +369,8 @@ final class InputInjector {
         guard let ev = CGEvent(mouseEventSource: source, mouseType: type,
                                mouseCursorPosition: p, mouseButton: button) else { return }
         ev.setIntegerValueField(.mouseEventClickState, value: 1)
-        // Don't inherit stale modifier / secondary-button state from the event source.
-        ev.flags = .maskNonCoalesced
+        // Include held sidebar modifiers; don't inherit stale state from the source.
+        ev.flags = injectedEventFlags()
         let isMove = type == .leftMouseDragged || type == .mouseMoved
         if !isMove || button == .right {
             logPost("mouse \(type.rawValue)", at: p, button: button, flags: ev.flags)
@@ -374,18 +386,55 @@ final class InputInjector {
         postMouse(type: type, at: p, button: .right)
     }
 
-    private func postKeyCommand(keyCode: UInt16, flags: NSEvent.ModifierFlags) {
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode),
-                                 keyDown: true) else { return }
-        down.flags = CGEventFlags(rawValue: UInt64(flags.rawValue))
-        logPost("keyDown vk=\(keyCode)", flags: down.flags)
-        down.post(tap: .cghidEventTap)
+    private func keyboardEventSource() -> CGEventSource {
+        CGEventSource(stateID: .privateState) ?? source
+    }
 
-        guard let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode),
+    private func modifierKeyMask(for keyCode: UInt16) -> CGEventFlags? {
+        switch keyCode {
+        case WireKeyCode.option, 0x3D: return .maskAlternate
+        case 0x38, 0x3C: return .maskShift
+        case 0x37, 0x36: return .maskCommand
+        case 0x3B, 0x3E: return .maskControl
+        default: return nil
+        }
+    }
+
+    private func injectedEventFlags(extra: CGEventFlags = []) -> CGEventFlags {
+        .maskNonCoalesced.union(heldModifiers).union(extra)
+    }
+
+    private func postKeyDown(keyCode: UInt16, flags: NSEvent.ModifierFlags = []) {
+        let src = keyboardEventSource()
+        guard let down = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(keyCode),
+                                 keyDown: true) else { return }
+        let explicit = CGEventFlags(rawValue: UInt64(flags.rawValue))
+        if let mask = modifierKeyMask(for: keyCode) {
+            heldModifiers.insert(mask)
+        }
+        down.flags = injectedEventFlags(extra: explicit)
+        logPost("keyDown vk=\(keyCode)", flags: down.flags)
+        down.post(tap: .cgSessionEventTap)
+    }
+
+    private func postKeyUp(keyCode: UInt16, flags: NSEvent.ModifierFlags = []) {
+        let src = keyboardEventSource()
+        guard let up = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(keyCode),
                                keyDown: false) else { return }
-        up.flags = CGEventFlags(rawValue: UInt64(flags.rawValue))
+        let explicit = CGEventFlags(rawValue: UInt64(flags.rawValue))
+        if let mask = modifierKeyMask(for: keyCode) {
+            heldModifiers.remove(mask)
+            up.flags = injectedEventFlags(extra: explicit)
+        } else {
+            up.flags = injectedEventFlags(extra: explicit)
+        }
         logPost("keyUp vk=\(keyCode)", flags: up.flags)
-        up.post(tap: .cghidEventTap)
+        up.post(tap: .cgSessionEventTap)
+    }
+
+    private func postKeyCommand(keyCode: UInt16, flags: NSEvent.ModifierFlags) {
+        postKeyDown(keyCode: keyCode, flags: flags)
+        postKeyUp(keyCode: keyCode, flags: flags)
     }
 
     private func markInjected() {
@@ -429,6 +478,8 @@ final class InputInjector {
             Log.info("[input] recv proximity entering=\(obj["entering"] ?? "?") eraser=\(obj["eraser"] ?? "?") | \(stateLine())")
         case WireInput.barrelButton:
             Log.info("[input] recv barrelButton down=\(obj["down"] ?? "?") | \(stateLine())")
+        case WireInput.key:
+            Log.info("[input] recv key vk=\(obj["keyCode"] ?? "?") down=\(obj["down"] ?? "?") | \(stateLine())")
         default:
             break
         }

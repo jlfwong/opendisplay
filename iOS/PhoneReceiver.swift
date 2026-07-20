@@ -748,6 +748,10 @@ final class PhoneReceiver: ObservableObject {
         sendControl(["type": WireInput.barrelButton, "down": down, "x": x, "y": y])
     }
 
+    func sendKey(keyCode: UInt16, down: Bool) {
+        sendControl(["type": WireInput.key, "keyCode": Int(keyCode), "down": down])
+    }
+
     /// Match each pen sample to the first frame captured on the Mac after it.
     private func recordStrokeLatencies(displayDevMs: Double, captureMs: Double,
                                        sendMs: Double?, photon: Bool) {

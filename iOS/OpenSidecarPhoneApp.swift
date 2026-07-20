@@ -72,7 +72,11 @@ struct ReceiverScreen: View {
             ZStack {
                 if isStreaming {
                     HStack(spacing: 0) {
-                        SidebarView(width: PhoneReceiver.sidebarWidthPoints)
+                        SidebarView(width: PhoneReceiver.sidebarWidthPoints) { keyCode, down in
+                            if model.receiver.connected || !down {
+                                model.receiver.sendKey(keyCode: keyCode, down: down)
+                            }
+                        }
                         ZStack {
                             VideoLayerView(displayLayer: model.receiver.displayLayer,
                                            receiver: model.receiver,
