@@ -147,6 +147,13 @@ final class TouchGestureRecognizerTests: XCTestCase {
             }
             return false
         })
+        // Fingers moved down (+y) — scroll dy should be positive (natural direction).
+        XCTAssertTrue(scrollEffects.contains { effect in
+            if case .scroll(_, let dy, let phase) = effect, phase == .changed {
+                return dy > 0
+            }
+            return false
+        })
 
         sink.reset()
         process(contacts: [

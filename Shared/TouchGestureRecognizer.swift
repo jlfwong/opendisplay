@@ -509,7 +509,7 @@ final class TouchGestureRecognizer {
                             scrollPhaseActive = true
                             lockedGesture = .scroll
                         }
-                        emit(.scroll(dx: dxRaw, dy: -dyRaw, phase: .changed))
+                        emit(.scroll(dx: dxRaw, dy: dyRaw, phase: .changed))
                     }
                 }
             case .none:
