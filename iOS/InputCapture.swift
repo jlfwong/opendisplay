@@ -27,7 +27,6 @@ final class InputCaptureEngine: NSObject {
     private struct PenStroke {
         var start: CGPoint
         var sentDown: Bool
-        var proximitySent: Bool
     }
 
     func install(on view: UIView) {
@@ -66,14 +65,12 @@ final class InputCaptureEngine: NSObject {
         switch gr.state {
         case .began, .changed:
             if !hoverInRange {
-                onProximity?(true, false)
                 hoverInRange = true
                 logCapture("hover enter")
             }
             emitPencil(.hover, x: nx, y: ny, pressure: 0, azimuth: 0, altitude: .pi / 2, rotation: 0, osDeliveredMs: osMs)
         case .ended, .cancelled, .failed:
             if hoverInRange {
-                onProximity?(false, false)
                 hoverInRange = false
                 logCapture("hover exit")
             }
@@ -187,13 +184,12 @@ final class InputCaptureEngine: NSObject {
         }
 
         if hoverInRange {
-            onProximity?(false, false)
             hoverInRange = false
         }
 
         if !ended && !activePens.contains(id) {
             activePens.insert(id)
-            penStrokes[id] = PenStroke(start: loc, sentDown: false, proximitySent: false)
+            penStrokes[id] = PenStroke(start: loc, sentDown: false)
             logCapture("pen contact began (waiting for move/tap)")
             return
         }
@@ -206,10 +202,6 @@ final class InputCaptureEngine: NSObject {
             if !stroke.sentDown {
                 guard moved > tapMoveThreshold else { return }
                 stroke.sentDown = true
-                if !stroke.proximitySent {
-                    onProximity?(true, false)
-                    stroke.proximitySent = true
-                }
                 penStrokes[id] = stroke
                 if let (sx, sy) = norm(stroke.start) {
                     logCapture("pen stroke down @ \(fmt(sx, sy))")
@@ -230,9 +222,6 @@ final class InputCaptureEngine: NSObject {
 
         defer {
             activePens.remove(id)
-            if let stroke = penStrokes[id], stroke.proximitySent {
-                onProximity?(false, false)
-            }
             penStrokes.removeValue(forKey: id)
         }
 

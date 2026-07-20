@@ -26,6 +26,7 @@ newnewicon.png
 # Local developer config (signing team etc.)
 .env
 .claude/
+.cursor/
 
 # Fastlane generated output
 fastlane/report.xml

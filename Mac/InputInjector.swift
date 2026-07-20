@@ -18,12 +18,12 @@ final class InputInjector {
     private var fingerDown = false
     private var touchLeftDown = false
     private var eraser = false
+    /// True when the current pen contact is a zero-pressure tap (mouse, not tablet).
+    private var pencilTapMode = false
 
     private let touchRecognizer: TouchGestureRecognizer
 
     private let deviceID: Int64 = 1
-    private let vendorID: Int64 = 0x056A
-    private let capabilityMask: Int64 = 0x00FE
 
     init(displayID: CGDirectDisplayID) {
         self.displayID = displayID
@@ -88,17 +88,18 @@ final class InputInjector {
     // MARK: - Proximity
 
     private func handleProximity(entering: Bool, eraser: Bool) {
+        // Track pen-in-range internally. Posting tabletProximity CGEvents causes
+        // macOS to interpret rapid enter/exit as system gestures (Show Desktop).
         if entering {
             if !inRange || eraser != self.eraser {
-                postProximity(entering: true, eraser: eraser)
                 self.eraser = eraser
                 inRange = true
-                logState("prox enter")
+                logState("prox enter (wire)")
             }
         } else {
-            postProximity(entering: false, eraser: self.eraser)
+            guard inRange else { return }
             inRange = false
-            logState("prox exit")
+            logState("prox exit (wire)")
         }
     }
 
@@ -116,34 +117,38 @@ final class InputInjector {
         let rotation = obj["rotation"] as? Double ?? 0
         let (tiltX, tiltY) = deriveTilt(azimuth: azimuth, altitude: altitude)
 
-        if !inRange {
-            postProximity(entering: true, eraser: false)
-            inRange = true
-            eraser = false
-        }
-
         switch phase {
         case .down:
-            postTabletPoint(phase: .down, x: x, y: y, pressure: pressure,
-                            tiltX: tiltX, tiltY: tiltY, rotation: rotation)
+            if pressure < 0.01 {
+                pencilTapMode = true
+                postMouse(type: .leftMouseDown, at: screenPoint(nx: x, ny: y), button: .left)
+            } else {
+                pencilTapMode = false
+                postTabletPoint(phase: .down, x: x, y: y, pressure: pressure,
+                                tiltX: tiltX, tiltY: tiltY, rotation: rotation)
+            }
             penDown = true
-            logState("pencil down p=\(String(format: "%.2f", pressure))")
+            logState("pencil down p=\(String(format: "%.2f", pressure)) tap=\(pencilTapMode)")
         case .move:
+            pencilTapMode = false
             if penDown {
                 postTabletPoint(phase: .drag, x: x, y: y, pressure: pressure,
                                 tiltX: tiltX, tiltY: tiltY, rotation: rotation)
             } else {
-                postTabletPoint(phase: .hover, x: x, y: y, pressure: 0,
-                                tiltX: tiltX, tiltY: tiltY, rotation: rotation)
+                postMouse(type: .mouseMoved, at: screenPoint(nx: x, ny: y), button: .left)
             }
         case .up:
-            postTabletPoint(phase: .up, x: x, y: y, pressure: 0,
-                            tiltX: tiltX, tiltY: tiltY, rotation: rotation)
+            if pencilTapMode {
+                postMouse(type: .leftMouseUp, at: screenPoint(nx: x, ny: y), button: .left)
+                pencilTapMode = false
+            } else {
+                postTabletPoint(phase: .up, x: x, y: y, pressure: 0,
+                                tiltX: tiltX, tiltY: tiltY, rotation: rotation)
+            }
             penDown = false
             logState("pencil up")
         case .hover:
-            postTabletPoint(phase: .hover, x: x, y: y, pressure: 0,
-                            tiltX: tiltX, tiltY: tiltY, rotation: rotation)
+            postMouse(type: .mouseMoved, at: screenPoint(nx: x, ny: y), button: .left)
         }
 
         markInjected()
@@ -361,24 +366,6 @@ final class InputInjector {
 
     private enum PointPhase { case down, drag, up, hover }
 
-    private func postProximity(entering: Bool, eraser: Bool) {
-        guard let ev = CGEvent(source: source) else { return }
-        ev.type = .tabletProximity
-        ev.setIntegerValueField(.tabletProximityEventVendorID, value: vendorID)
-        ev.setIntegerValueField(.tabletProximityEventTabletID, value: 1)
-        ev.setIntegerValueField(.tabletProximityEventPointerID, value: 1)
-        ev.setIntegerValueField(.tabletProximityEventDeviceID, value: deviceID)
-        ev.setIntegerValueField(.tabletProximityEventSystemTabletID, value: 1)
-        ev.setIntegerValueField(.tabletProximityEventVendorPointerType, value: eraser ? 3 : 1)
-        ev.setIntegerValueField(.tabletProximityEventVendorPointerSerialNumber, value: 1)
-        ev.setIntegerValueField(.tabletProximityEventVendorUniqueID, value: 1)
-        ev.setIntegerValueField(.tabletProximityEventCapabilityMask, value: capabilityMask)
-        ev.setIntegerValueField(.tabletProximityEventPointerType, value: eraser ? 3 : 1)
-        ev.setIntegerValueField(.tabletProximityEventEnterProximity, value: entering ? 1 : 0)
-        logPost("tabletProximity entering=\(entering) eraser=\(eraser)", flags: ev.flags)
-        ev.post(tap: .cghidEventTap)
-    }
-
     private func postTabletPoint(phase: PointPhase, x: Double?, y: Double?,
                                  pressure: Double, tiltX: Double, tiltY: Double,
                                  rotation: Double) {
@@ -457,12 +444,13 @@ final class InputInjector {
 
     // MARK: - Coordinate mapping
 
-    /// Map video-normalized coords (origin top-left) to global screen points
-    /// (origin bottom-left, per CoreGraphics).
+    /// Map video-normalized coords (origin top-left on the iPad) to global
+    /// screen points on the virtual display. This pipeline's captured frame
+    /// and touch normalization share the same top-down Y axis, so no flip.
     private func screenPoint(nx: Double, ny: Double) -> CGPoint {
         let bounds = CGDisplayBounds(displayID)
         return CGPoint(x: bounds.minX + nx * bounds.width,
-                       y: bounds.maxY - ny * bounds.height)
+                       y: bounds.minY + ny * bounds.height)
     }
 
     private func currentCursor() -> CGPoint {
