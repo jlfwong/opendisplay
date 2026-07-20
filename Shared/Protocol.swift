@@ -13,6 +13,12 @@ enum WireProtocol {
     /// The protocol version this build speaks.
     static let version = 2
 
+    /// Default control port (video + input).
+    static let defaultControlPort: UInt16 = 9000
+
+    /// Follow-up after input send completes — carries Mac-unified `tSend`.
+    static let inpSent = "inpSent"
+
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change
     /// raises it — raising this is what turns "peer too old" into a hard gate.

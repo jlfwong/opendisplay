@@ -35,6 +35,11 @@ struct PerfStats: Equatable {
     var macPending = 0           // Mac send queue depth right now
     var inputP50 = 0.0           // touch sent → CGEvent injected on the Mac, ms
     var inputP95 = 0.0
+    var macPaintP50 = 0.0        // Mac inject → ScreenCaptureKit frame
+    var macPaintP95 = 0.0
+    var strokeP50 = 0.0          // pen on glass → iPad display
+    var strokeP95 = 0.0
+    var strokeSamples: [Double] = []
     var capFps = 0               // frames ScreenCaptureKit delivered on the Mac
     // Metal renderer path only:
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
@@ -93,6 +98,18 @@ final class PhoneReceiver: ObservableObject {
     private var macInputP50 = 0.0
     private var macInputP95 = 0.0
     private var macCapFps = 0
+    private var macPaintP50 = 0.0
+    private var macPaintP95 = 0.0
+
+    private struct PendingPenSample {
+        let devMs: Double
+        let macMs: Double
+        var matched = false
+    }
+    private var pendingPenSamples: [PendingPenSample] = []
+    private var strokeWindow: [Double] = []
+    private var strokeRing: [Double] = []
+    private var inputIdCounter = 1
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -126,6 +143,8 @@ final class PhoneReceiver: ObservableObject {
             if photon > -50, photon < 5000 {
                 self.photonWindow.append(max(photon, 0))
             }
+            self.recordStrokeLatencies(displayDevMs: presentedWallMs, captureMs: captureMs,
+                                       sendMs: nil, photon: true)
         }
     }
 
@@ -351,6 +370,8 @@ final class PhoneReceiver: ObservableObject {
             macInputP50 = obj["inp50"] as? Double ?? macInputP50
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
             macCapFps = obj["capFps"] as? Int ?? macCapFps
+            macPaintP50 = obj["paint50"] as? Double ?? macPaintP50
+            macPaintP95 = obj["paint95"] as? Double ?? macPaintP95
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -442,13 +463,19 @@ final class PhoneReceiver: ObservableObject {
             if let major = c.major { d["major"] = major }
             return d
         }
-        var msg: [String: Any] = [
-            "type": WireInput.touches,
-            "phase": wirePhase(for: contacts),
-            "contacts": contactDicts,
-        ]
-        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
-        sendControl(msg)
+        queue.async {
+            let devMs = self.nowMs
+            let macMs = self.clockOffsetMs.map { devMs + $0 }
+            let inpId = self.nextInputId()
+            var msg: [String: Any] = [
+                "type": WireInput.touches,
+                "phase": self.wirePhase(for: contacts),
+                "contacts": contactDicts,
+                "inpId": inpId,
+            ]
+            if let macMs { msg["t"] = macMs }
+            self.sendControl(msg, stampWire: true)
+        }
     }
 
     private func wirePhase(for contacts: [WireTouchContact]) -> String {
@@ -462,17 +489,33 @@ final class PhoneReceiver: ObservableObject {
     func sendPencil(phase: PencilPhase, x: Double, y: Double,
                     pressure: Double, azimuth: Double, altitude: Double,
                     rotation: Double, osMs: Double, captureMs: Double) {
-        var msg: [String: Any] = [
-            "type": WireInput.pencil,
-            "phase": phase.rawValue,
-            "x": x, "y": y,
-            "pressure": pressure,
-            "azimuth": azimuth,
-            "altitude": altitude,
-            "rotation": rotation,
-        ]
-        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
-        sendControl(msg)
+        queue.async {
+            let devMs = self.nowMs
+            let macMs = self.clockOffsetMs.map { devMs + $0 }
+            let inpId = self.nextInputId()
+            var msg: [String: Any] = [
+                "type": WireInput.pencil,
+                "phase": phase.rawValue,
+                "x": x, "y": y,
+                "pressure": pressure,
+                "azimuth": azimuth,
+                "altitude": altitude,
+                "rotation": rotation,
+                "inpId": inpId,
+            ]
+            if let macMs { msg["t"] = macMs }
+            if phase != .hover, let macMs {
+                self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
+                if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
+            }
+            self.sendControl(msg, stampWire: true)
+        }
+    }
+
+    private func nextInputId() -> Int {
+        let id = inputIdCounter
+        inputIdCounter += 1
+        return id
     }
 
     func sendProximity(entering: Bool, eraser: Bool) {
@@ -491,15 +534,39 @@ final class PhoneReceiver: ObservableObject {
         sendControl(["type": WireInput.shortcut, "action": WireShortcut.undo])
     }
 
-    private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil) {
+    private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
+                               stampWire: Bool = false) {
         guard let conn = conn ?? connection,
               let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
         var header = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &header, count: 4)
         frame.append(payload)
-        conn.send(content: frame, completion: .contentProcessed { error in
+        let inpId = message["inpId"] as? Int
+        conn.send(content: frame, completion: .contentProcessed { [weak self] error in
             if let error { Log.info("control send error: \(error)") }
+            guard let self, stampWire, let inpId, let offset = self.clockOffsetMs else { return }
+            self.sendControl(["type": WireProtocol.inpSent, "inpId": inpId, "tSend": self.nowMs + offset])
         })
+    }
+
+    private func recordStrokeLatencies(displayDevMs: Double, captureMs: Double,
+                                       sendMs: Double?, photon: Bool) {
+        guard clockOffsetMs != nil else { return }
+        for i in pendingPenSamples.indices {
+            guard !pendingPenSamples[i].matched else { continue }
+            guard captureMs >= pendingPenSamples[i].macMs else { continue }
+            let lat = displayDevMs - pendingPenSamples[i].devMs
+            if lat > 0, lat < 500 {
+                strokeWindow.append(lat)
+                strokeRing.append(lat)
+                if strokeRing.count > maxSamples { strokeRing.removeFirst() }
+                if LatencyTelemetry.detailedLogEnabled {
+                    Log.info("\(LatencyTelemetry.logPrefix) stroke ms=\(String(format: "%.1f", lat))")
+                }
+            }
+            pendingPenSamples[i].matched = true
+        }
+        pendingPenSamples.removeAll { $0.matched && displayDevMs - $0.devMs > 500 }
     }
 
     // MARK: - Socket read + length-prefixed deframing
@@ -758,6 +825,11 @@ final class PhoneReceiver: ObservableObject {
             stats.macPending = macPending
             stats.inputP50 = macInputP50
             stats.inputP95 = macInputP95
+            stats.macPaintP50 = macPaintP50
+            stats.macPaintP95 = macPaintP95
+            stats.strokeP50 = percentile(strokeWindow, 0.5)
+            stats.strokeP95 = percentile(strokeWindow, 0.95)
+            stats.strokeSamples = strokeRing
             stats.capFps = macCapFps
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)

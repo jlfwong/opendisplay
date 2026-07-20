@@ -104,7 +104,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
-    private let queue = DispatchQueue(label: "sender.video")
+    private let queue = DispatchQueue(label: "sender.video", qos: .userInteractive)
+    private func onVideoQueue(_ block: @escaping () -> Void) {
+        queue.async {
+            VideoQueueThread.markSenderVideo()
+            block()
+        }
+    }
+
+    private func onVideoQueueAfter(deadline: DispatchTime, _ block: @escaping () -> Void) {
+        queue.asyncAfter(deadline: deadline) {
+            VideoQueueThread.markSenderVideo()
+            block()
+        }
+    }
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -164,6 +177,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Input latency: touches arrive stamped in our clock (the phone applies
     // its sync offset); delta to now = network + deframe + dispatch.
     private var inputLatencies: [Double] = []
+    /// Inject → next ScreenCaptureKit frame (Mac app render + compositor).
+    private var paintWaitWindow: [Double] = []
     // Capture cadence: SCK only emits on content change, so the phone can't
     // tell "Mac rendered 45fps" from "frames got lost" — count deliveries here.
     private var capFrames = 0
@@ -193,7 +208,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() async throws {
         stopped = false
-        queue.async { self.connect() }   // dial state lives on `queue`
+        onVideoQueue { self.connect() }   // dial state lives on `queue`
         if !monitorsStarted {
             monitorsStarted = true
             schedulePing()
@@ -531,6 +546,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         let params = NWParameters(tls: nil, tcp: options)
+        params.serviceClass = .interactiveVideo
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         conn.stateUpdateHandler = { [weak self] state in
@@ -644,10 +660,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Liveness (ping + watchdog)
 
     private func schedulePing() {
-        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        onVideoQueueAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady {
-                // Liveness + send-side health for the phone's overlay.
                 let elapsed = Date().timeIntervalSince(self.capWindowStart)
                 let capFps = elapsed > 0 ? Int(Double(self.capFrames) / elapsed) : 0
                 self.capFrames = 0
@@ -655,7 +670,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                let paintSorted = self.paintWaitWindow.sorted()
+                let paint50 = paintSorted.isEmpty ? 0 : paintSorted[paintSorted.count / 2].rounded()
+                let paint95 = paintSorted.isEmpty ? 0 : paintSorted[min(paintSorted.count - 1, Int(Double(paintSorted.count) * 0.95))].rounded()
+                self.paintWaitWindow.removeAll(keepingCapacity: true)
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"paint50\":\(paint50),\"paint95\":\(paint95),\"capFps\":\(capFps)}")
             }
             self.schedulePing()
         }
@@ -837,14 +856,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         case WireInput.touches, WireInput.pencil, WireInput.proximity, WireInput.barrelButton:
-            inputInjector?.handleControl(obj)
-            if let t = obj["t"] as? Double {
-                let delta = Date().timeIntervalSince1970 * 1000 - t
-                if delta > -50, delta < 1000 {
-                    inputLatencies.append(max(delta, 0))
-                    if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
-                }
+            let phase = obj["phase"] as? String
+            dispatchInput(type: type, phase: phase, obj: obj) {
+                self.inputInjector?.handleControl(obj)
             }
+            recordInputLatency(obj)
+        case WireProtocol.inpSent:
+            break
         case WireInput.key:
             if let keyCode = obj["keyCode"] as? Int {
                 let down = (obj["down"] as? Bool) ?? false
@@ -861,6 +879,33 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             needsKeyframe = true
         default:
             Log.info("unknown control message type: \(type)")
+        }
+    }
+
+    private func recordInputLatency(_ obj: [String: Any]) {
+        if let t = obj["t"] as? Double {
+            let delta = Date().timeIntervalSince1970 * 1000 - t
+            if delta > -50, delta < 1000 {
+                inputLatencies.append(max(delta, 0))
+                if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
+            }
+        }
+    }
+
+    private func dispatchInput(type: String, phase: String?, obj: [String: Any], work: () -> Void) {
+        let recvMs = Date().timeIntervalSince1970 * 1000
+        let inpId = obj["inpId"] as? Int
+        let penDown = inputInjector?.isPenDown ?? false
+        let fingerDown = inputInjector?.isFingerDown ?? false
+        InputRecvSignpost.recvStarted(recvMs: recvMs, type: type, phase: phase, inpId: inpId,
+                                        penDown: penDown, fingerDown: fingerDown)
+        work()
+        let endMs = Date().timeIntervalSince1970 * 1000
+        InputRecvSignpost.recvEnded(endMs: endMs, type: type, phase: phase,
+                                    penDown: inputInjector?.isPenDown ?? false,
+                                    fingerDown: inputInjector?.isFingerDown ?? false)
+        if phase == "ended" || phase == "cancelled" || phase == "up" {
+            InputRecvSignpost.endStroke()
         }
     }
 
@@ -931,6 +976,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastPixelBuffer = pixelBuffer
         lastCaptureAt = Date()
         capFrames += 1
+        let capturedAtMs = Date().timeIntervalSince1970 * 1000
+        if let inj = inputInjector?.lastInjectMs {
+            let wait = capturedAtMs - inj
+            if wait >= 0, wait < 200 {
+                paintWaitWindow.append(wait)
+                if paintWaitWindow.count > 240 { paintWaitWindow.removeFirst(120) }
+            }
+        }
 
         // No receiver, or the socket is backed up: skip this frame entirely.
         guard connectionReady else { return }
