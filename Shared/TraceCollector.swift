@@ -18,6 +18,7 @@ final class TraceCollector {
     private var nextInputId = 1
     private var macSpans: [TraceSpan] = []
     private var ipadSpans: [TraceSpan] = []
+    private var usbmuxEvents: [UsbmuxLogEvent] = []
     private var notes: [String] = []
     private var clockOffsetMs: Double = 0
     private let maxSpans = 100_000
@@ -56,6 +57,7 @@ final class TraceCollector {
         nextInputId = 1
         macSpans.removeAll(keepingCapacity: true)
         ipadSpans.removeAll(keepingCapacity: true)
+        usbmuxEvents.removeAll(keepingCapacity: true)
         notes.removeAll(keepingCapacity: true)
         frameMarks.removeAll(keepingCapacity: true)
         inputMarks.removeAll(keepingCapacity: true)
@@ -77,6 +79,12 @@ final class TraceCollector {
         lock.lock()
         defer { lock.unlock() }
         return sessionId
+    }
+
+    var sessionStartedAtMs: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return startedAtMs
     }
 
     var isActive: Bool {
@@ -243,6 +251,7 @@ final class TraceCollector {
             maxFrames: maxFrames,
             macSpans: macSpans,
             ipadSpans: uploaded,
+            usbmuxEvents: usbmuxEvents.isEmpty ? nil : usbmuxEvents,
             notes: notes)
     }
 
@@ -257,6 +266,7 @@ final class TraceCollector {
             maxFrames: maxFrames,
             macSpans: macSpans,
             ipadSpans: ipadSpans,
+            usbmuxEvents: usbmuxEvents.isEmpty ? nil : usbmuxEvents,
             notes: notes)
     }
 
@@ -282,6 +292,21 @@ final class TraceCollector {
         lock.lock()
         notes.append(note)
         lock.unlock()
+    }
+
+    func ingestUsbmuxEvents(_ events: [UsbmuxLogEvent]) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard active, !events.isEmpty else { return }
+        let remaining = max(0, maxSpans - macSpans.count - ipadSpans.count)
+        guard remaining > 0 else { return }
+        usbmuxEvents.append(contentsOf: events.prefix(remaining))
+    }
+
+    func usbmuxSnapshot() -> [UsbmuxLogEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return usbmuxEvents
     }
 
     private var lastIngestSeq = 0

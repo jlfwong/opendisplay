@@ -19,6 +19,13 @@ enum WireProtocol {
     /// Dedicated trace stream — same framing as control, but isolated from pencil.
     static func tracePort(controlPort: UInt16) -> UInt16 { controlPort + 1 }
 
+    /// Tiny heartbeat stream on its own usbmux connection (controlPort + 2).
+    /// Isolated from video+input on :9000 so we can see per-connection vs pipe stalls.
+    static func heartbeatPort(controlPort: UInt16) -> UInt16 { controlPort + 2 }
+
+    /// Follow-up after input send completes — carries Mac-unified `tSend` (contentProcessed).
+    static let inpSent = "inpSent"
+
     /// Oldest peer protocol version this build still supports. Stays at 1
     /// (support everything) until a deliberate two-phase breaking change
     /// raises it — raising this is what turns "peer too old" into a hard gate.
@@ -34,4 +41,10 @@ enum WireProtocol {
 enum WireMessage {
     static let welcome = "welcome"                  // Mac -> phone: Mac's pv + min supported
     static let updateRequired = "updateRequired"    // Mac -> phone: peer is below the Mac's floor
+}
+
+/// Heartbeat channel (port controlPort + 2) — length-prefixed JSON, same as control.
+enum WireHeartbeat {
+    static let ping = "hb"
+    static let pong = "hbPong"
 }

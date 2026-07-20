@@ -65,8 +65,11 @@ final class PhoneReceiver: ObservableObject {
 
     private var listener: NWListener?
     private var traceListener: NWListener?
+    private var heartbeatListener: NWListener?
+    private var heartbeatConnection: NWConnection?
     private var listenerHealthy = false
     private var traceListenerHealthy = false
+    private var heartbeatListenerHealthy = false
     private var connection: NWConnection?
     private var traceConnection: NWConnection?
     private var pendingTraceMessages: [[String: Any]] = []
@@ -83,6 +86,7 @@ final class PhoneReceiver: ObservableObject {
     private var lastDataReceived = Date()
     private var port: UInt16 = WireProtocol.defaultControlPort
     private var tracePort: UInt16 = WireProtocol.tracePort(controlPort: WireProtocol.defaultControlPort)
+    private var heartbeatPort: UInt16 = WireProtocol.heartbeatPort(controlPort: WireProtocol.defaultControlPort)
     private var monitorsStarted = false
 
     private var framesThisWindow = 0
@@ -244,9 +248,11 @@ final class PhoneReceiver: ObservableObject {
     func start(port: UInt16 = WireProtocol.defaultControlPort) {
         self.port = port
         self.tracePort = WireProtocol.tracePort(controlPort: port)
+        self.heartbeatPort = WireProtocol.heartbeatPort(controlPort: port)
         queue.async {
             self.startListener()
             self.startTraceListener()
+            self.startHeartbeatListener()
         }
         if !monitorsStarted {
             monitorsStarted = true
@@ -265,6 +271,9 @@ final class PhoneReceiver: ObservableObject {
             } else if !self.traceListenerHealthy {
                 Log.info("trace listener not healthy — restarting")
                 self.startTraceListener()
+            } else if !self.heartbeatListenerHealthy {
+                Log.info("heartbeat listener not healthy — restarting")
+                self.startHeartbeatListener()
             }
         }
     }
@@ -278,9 +287,15 @@ final class PhoneReceiver: ObservableObject {
         traceListenerHealthy = false
         traceConnection?.cancel()
         traceConnection = nil
+        heartbeatConnection?.cancel()
+        heartbeatConnection = nil
+        heartbeatListener?.cancel()
+        heartbeatListener = nil
+        heartbeatListenerHealthy = false
         pendingTraceMessages.removeAll(keepingCapacity: true)
         startListener()
         startTraceListener()
+        startHeartbeatListener()
     }
 
     private func startListener() {
@@ -391,6 +406,75 @@ final class PhoneReceiver: ObservableObject {
             }
         }
         traceListener?.start(queue: queue)
+    }
+
+    /// Heartbeat-only TCP (controlPort + 2) — tiny packets on an isolated usbmux connection.
+    private func startHeartbeatListener() {
+        do {
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
+            params.allowLocalEndpointReuse = true
+            params.serviceClass = .interactiveVideo
+            heartbeatListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: heartbeatPort)!)
+        } catch {
+            Log.info("heartbeat listener failed: \(error)")
+            return
+        }
+        heartbeatListener?.newConnectionHandler = { [weak self] conn in
+            guard let self else { return }
+            Log.info("heartbeat channel connection from \(String(describing: conn.endpoint))")
+            self.heartbeatConnection?.cancel()
+            self.heartbeatConnection = conn
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.receiveHeartbeat(on: conn)
+                case .failed, .cancelled:
+                    if self.heartbeatConnection === conn { self.heartbeatConnection = nil }
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+        }
+        heartbeatListener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.heartbeatListenerHealthy = true
+                Log.info("heartbeat listener ready :\(self.heartbeatPort)")
+            case .failed(let error):
+                Log.info("heartbeat listener failed: \(error)")
+                self.heartbeatListenerHealthy = false
+            case .cancelled:
+                self.heartbeatListenerHealthy = false
+            default: break
+            }
+        }
+        heartbeatListener?.start(queue: queue)
+    }
+
+    private func receiveHeartbeat(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
+            guard let self, error == nil, let data, data.count == 4 else { return }
+            let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
+            guard len > 0, len < 1 << 16 else { return }
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
+                guard let self, error == nil, let payload, payload.count == len else { return }
+                self.handleHeartbeatJSON(payload, on: conn)
+                self.receiveHeartbeat(on: conn)
+            }
+        }
+    }
+
+    private func handleHeartbeatJSON(_ payload: Data, on conn: NWConnection) {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        if type == WireHeartbeat.ping, let t = obj["t"] as? Double {
+            let mt = nowMs
+            sendControl(["type": WireHeartbeat.pong, "t": t, "mt": mt], on: conn)
+        }
     }
 
     private func flushPendingTraceMessages() {
@@ -561,7 +645,7 @@ final class PhoneReceiver: ObservableObject {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
             }
-            self.sendControl(msg) {
+            self.sendControl(msg, stampWire: inpId != nil) {
                 guard traceThis, let inpId else { return }
                 IPadTrace.recordInput(inputId: inpId, phase: phase,
                                       osMs: osMs, captureMs: captureMs,
@@ -604,7 +688,7 @@ final class PhoneReceiver: ObservableObject {
                 self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
                 if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
             }
-            self.sendControl(msg) {
+            self.sendControl(msg, stampWire: inpId != nil) {
                 guard traceThis, let inpId else { return }
                 IPadTrace.recordInput(inputId: inpId, phase: phase.rawValue,
                                       osMs: osMs, captureMs: captureMs,
@@ -713,16 +797,26 @@ final class PhoneReceiver: ObservableObject {
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
+                               stampWire: Bool = false,
                                sent: (() -> Void)? = nil) {
         let send = { [weak self] in
             guard let self else { return }
-            guard let conn = conn ?? self.connection,
-                  let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
+            guard let conn = conn ?? self.connection else { return }
+            var msg = message
+            if stampWire, let offset = self.clockOffsetMs {
+                msg["tHandoff"] = self.nowMs + offset
+            }
+            guard let payload = try? JSONSerialization.data(withJSONObject: msg) else { return }
             var header = UInt32(payload.count).bigEndian
             var frame = Data(bytes: &header, count: 4)
             frame.append(payload)
+            let inpId = message["inpId"] as? Int
             conn.send(content: frame, completion: .contentProcessed { error in
                 if let error { Log.info("control send error: \(error)") }
+                if stampWire, let inpId, let offset = self.clockOffsetMs {
+                    let tSend = self.nowMs + offset
+                    self.sendControl(["type": WireProtocol.inpSent, "inpId": inpId, "tSend": tSend])
+                }
                 sent?()
             })
         }

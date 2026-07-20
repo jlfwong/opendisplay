@@ -15,6 +15,7 @@ enum MacTrace {
     private static var lastCaptureMs: Double = 0
     private static var finalizedSessions: Set<String> = []
     private static var pingSeq = 0
+    private static var heartbeatSeq = 0
     private static var finalizeWork: DispatchWorkItem?
     private static let finalizeQueue = DispatchQueue(label: "trace.finalize")
     /// Ingest + disk export — never blocks the input/video queue.
@@ -24,6 +25,7 @@ enum MacTrace {
                                  maxFrames: Int, maxInputs: Int,
                                  clockOffsetMs: Double = 0) {
         let now = Date().timeIntervalSince1970 * 1000
+        UsbmuxLogMonitor.beginSession()
         _ = TraceCollector.shared.start(.init(
             sessionId: sessionId,
             mode: mode,
@@ -41,6 +43,10 @@ enum MacTrace {
         lastCaptureMs = now
         finalizedSessions.remove(sessionId)
         pingSeq = 0
+        heartbeatSeq = 0
+        pendingWireRecv.removeAll()
+        pendingWireSend.removeAll()
+        pendingWireFallback.removeAll()
         lock.unlock()
         Log.info("[trace] Mac session started id=\(sessionId) mode=\(mode.rawValue) maxFrames=\(maxFrames) maxInputs=\(maxInputs)")
     }
@@ -162,11 +168,57 @@ enum MacTrace {
                                    rowId: id, startMs: recvMs, endMs: pongMs, side: .mac)
     }
 
-    static func inputWire(inputId: Int, wireStartMs: Double, recvMs: Double) {
+    /// Round-trip on the dedicated heartbeat usbmux connection (:controlPort+2).
+    static func recordHeartbeatRtt(sendMs: Double, recvMs: Double) {
+        guard TraceCollector.shared.tracesInput else { return }
+        lock.lock()
+        heartbeatSeq += 1
+        let id = heartbeatSeq
+        lock.unlock()
+        let rtt = recvMs - sendMs
+        TraceCollector.shared.span(TracePhase.heartbeatRtt, rowKind: TraceRowKind.heartbeat,
+                                   rowId: id, startMs: sendMs, endMs: recvMs, side: .mac,
+                                   meta: ["rtt_ms": String(format: "%.2f", rtt)])
+    }
+
+    static func inputWire(inputId: Int, wireStartMs: Double, recvMs: Double,
+                          leg: String = "tSend") {
         guard TraceCollector.shared.tracesInput else { return }
         TraceCollector.shared.span(TracePhase.inputWire, rowKind: TraceRowKind.input,
-                                   rowId: inputId, startMs: wireStartMs, endMs: recvMs, side: .mac)
+                                   rowId: inputId, startMs: wireStartMs, endMs: recvMs,
+                                   side: .mac, meta: ["leg": leg])
     }
+
+    /// iPad `inpSent` follow-up — contentProcessed time for a prior input message.
+    static func noteInputSent(inputId: Int, tSendMs: Double) {
+        lock.lock()
+        if let recvMs = pendingWireRecv.removeValue(forKey: inputId) {
+            pendingWireFallback.removeValue(forKey: inputId)
+            lock.unlock()
+            inputWire(inputId: inputId, wireStartMs: tSendMs, recvMs: recvMs, leg: "tSend")
+            return
+        }
+        pendingWireSend[inputId] = tSendMs
+        lock.unlock()
+    }
+
+    /// Recv an input message; finalize `input.wire` when matching `inpSent` arrives.
+    static func inputReceived(inputId: Int?, wireFallbackMs: Double?, recvMs: Double) {
+        guard TraceCollector.shared.tracesInput, let inputId else { return }
+        lock.lock()
+        if let tSend = pendingWireSend.removeValue(forKey: inputId) {
+            lock.unlock()
+            inputWire(inputId: inputId, wireStartMs: tSend, recvMs: recvMs, leg: "tSend")
+            return
+        }
+        pendingWireRecv[inputId] = recvMs
+        if let wireFallbackMs { pendingWireFallback[inputId] = wireFallbackMs }
+        lock.unlock()
+    }
+
+    private static var pendingWireRecv: [Int: Double] = [:]
+    private static var pendingWireSend: [Int: Double] = [:]
+    private static var pendingWireFallback: [Int: Double] = [:]
 
     static func inputDispatch(inputId: Int, recvMs: Double, injectStartMs: Double) {
         guard TraceCollector.shared.tracesInput else { return }
@@ -235,8 +287,11 @@ enum MacTrace {
               TraceCollector.shared.currentSessionId == sessionId else { return }
 
         flushPendingPaint(until: paintFlushDeadline())
-        TraceCollector.shared.appendNote("mac finalized: \(reason)")
+        flushPendingWire()
         let now = Date().timeIntervalSince1970 * 1000
+        let startedAt = TraceCollector.shared.sessionStartedAtMs
+        attachUsbmuxLogs(sessionStartedMs: startedAt, endedAtMs: now)
+        TraceCollector.shared.appendNote("mac finalized: \(reason)")
         let session = TraceCollector.shared.buildPartialSession(endedAtMs: now)
         do {
             let urls = try TraceFileWriter.write(session: session)
@@ -254,6 +309,33 @@ enum MacTrace {
         defer { lock.unlock() }
         let now = Date().timeIntervalSince1970 * 1000
         return max(lastCaptureMs, now)
+    }
+
+    private static func flushPendingWire() {
+        lock.lock()
+        let pending = pendingWireRecv
+        let fallbacks = pendingWireFallback
+        pendingWireRecv.removeAll()
+        pendingWireSend.removeAll()
+        pendingWireFallback.removeAll()
+        lock.unlock()
+        for (inputId, recvMs) in pending {
+            guard let start = fallbacks[inputId] else { continue }
+            inputWire(inputId: inputId, wireStartMs: start, recvMs: recvMs, leg: "tHandoff")
+        }
+    }
+
+    private static func attachUsbmuxLogs(sessionStartedMs: Double, endedAtMs: Double) {
+        let buffered = UsbmuxLogMonitor.bufferedEventCount()
+        let extra = UsbmuxLogMonitor.snapshot(from: sessionStartedMs - 500, to: endedAtMs + 500)
+        if !extra.isEmpty {
+            TraceCollector.shared.ingestUsbmuxEvents(extra)
+            TraceCollector.shared.appendNote("usbmux LogPackets: \(extra.count)/\(buffered) events in session window")
+        } else if UsbmuxLogMonitor.logPacketsEnabled {
+            TraceCollector.shared.appendNote("usbmux LogPackets enabled but 0/\(buffered) events in session window")
+        } else {
+            TraceCollector.shared.appendNote("usbmux LogPackets not enabled (scripts/enable-usbmux-logpackets.sh)")
+        }
     }
 
     /// Close any input.paint spans still waiting for SCK at session end.

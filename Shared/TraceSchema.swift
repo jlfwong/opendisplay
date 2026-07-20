@@ -37,6 +37,8 @@ struct TraceSession: Codable, Equatable {
     let maxFrames: Int
     let macSpans: [TraceSpan]
     let ipadSpans: [TraceSpan]
+    /// Parsed usbmuxd LogPackets lines (Mac wall-clock ms), merged at export.
+    var usbmuxEvents: [UsbmuxLogEvent]?
     let notes: [String]
 
     var allSpans: [TraceSpan] { macSpans + ipadSpans }
@@ -52,8 +54,8 @@ enum TracePhase {
     // Input: iPad OS delivery → Mac compositor paint
     static let inputOs = "input.os"               // UIKit delivery → InputCapture emit
     static let inputQueue = "input.queue"         // emit → receiver queue runs
-    static let inputSend = "input.send"           // queue → TCP send ack
-    static let inputWire = "input.wire"           // Mac recv (wire t → recv handler)
+    static let inputSend = "input.send"           // queue → contentProcessed (iPad)
+    static let inputWire = "input.wire"           // tSend (socket ack) → Mac recv
     static let inputDispatch = "input.dispatch"   // recv → inject start
     static let inputInject = "input.inject"       // CGEvent post
     static let inputPaint = "input.paint"         // inject → SCK captures change
@@ -74,12 +76,34 @@ enum TracePhase {
     // Ping/pong on control channel (:9000) — Mac-unified timeline
     static let pingRtt = "ping.rtt"             // iPad ping sent → pong received
     static let pingMac = "ping.mac"             // Mac recv ping → send pong
+
+    // Heartbeat on dedicated usbmux connection (controlPort + 2)
+    static let heartbeatRtt = "heartbeat.rtt"   // Mac hb sent → hbPong received
+    static let heartbeatMac = "heartbeat.mac"   // Mac recv hbPong processing
+}
+
+/// One parsed usbmuxd TCP packet log line (LogPackets pref).
+struct UsbmuxLogEvent: Codable, Equatable {
+    /// Mac wall-clock ms (same basis as trace spans).
+    let timeMs: Double
+    /// "in" (device→host) or "out" (host→device)
+    let direction: String
+    let seq: UInt32?
+    let ack: UInt32?
+    let win: UInt32?
+    let len: Int?
+    let sport: Int?
+    let dport: Int?
+    /// Raw log line (truncated) for debugging.
+    let raw: String
 }
 
 enum TraceRowKind {
     static let frame = "frame"
     static let input = "input"
     static let ping = "ping"
+    static let heartbeat = "heartbeat"
+    static let usbmux = "usbmux"
 }
 
 // MARK: - Chrome Trace Event Format (Perfetto-compatible)
@@ -110,6 +134,8 @@ enum TraceExporter {
     private enum Track {
         static let frames = 1
         static let ping = 2
+        static let heartbeat = 3
+        static let usbmux = 4
         /// One tid per input id — avoids stacking thousands of slices on one lane.
         static let inputBase = 1_000_000
 
@@ -117,6 +143,7 @@ enum TraceExporter {
             switch span.rowKind {
             case TraceRowKind.frame: return frames
             case TraceRowKind.ping: return ping
+            case TraceRowKind.heartbeat: return heartbeat
             case TraceRowKind.input: return inputBase + span.rowId
             default: return 0
             }
@@ -126,6 +153,7 @@ enum TraceExporter {
             switch span.rowKind {
             case TraceRowKind.frame: return "frames"
             case TraceRowKind.ping: return "ping / pong"
+            case TraceRowKind.heartbeat: return "heartbeat (:+2)"
             case TraceRowKind.input: return "input_\(span.rowId)"
             default: return span.rowKind
             }
@@ -152,7 +180,7 @@ enum TraceExporter {
     static func chromeTraceRelative(from session: TraceSession) -> ChromeTraceFile {
         var spans = session.allSpans
         spans.append(contentsOf: synthesizeMissingTransitSpans(in: spans))
-        let origin = spans.map(\.startMs).min() ?? session.startedAtMs
+        let origin = minOriginMs(spans: spans, session: session)
         var events: [ChromeTraceEvent] = []
         events.append(ChromeTraceEvent(
             name: "session_start",
@@ -165,6 +193,9 @@ enum TraceExporter {
             args: ["sessionId": session.sessionId]))
 
         events.append(contentsOf: threadNames(for: spans))
+        events.append(ChromeTraceEvent(
+            name: "thread_name", cat: "__metadata", ph: "M", ts: 0, dur: nil,
+            pid: pipelinePid, tid: Track.usbmux, args: ["name": "usbmuxd LogPackets"]))
 
         let ordered = spans.sorted {
             if $0.rowKind == TraceRowKind.input, $1.rowKind == TraceRowKind.input,
@@ -181,20 +212,60 @@ enum TraceExporter {
         for span in ordered {
             events.append(relativeSlice(span, origin: origin))
         }
+        events.append(contentsOf: usbmuxInstantEvents(session.usbmuxEvents ?? [], origin: origin))
 
         let inputIds = Set(spans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId))
         let frameIds = Set(spans.filter { $0.rowKind == TraceRowKind.frame }.map(\.rowId))
         let pingIds = Set(spans.filter { $0.rowKind == TraceRowKind.ping }.map(\.rowId))
+        let hbIds = Set(spans.filter { $0.rowKind == TraceRowKind.heartbeat }.map(\.rowId))
+        let usbmuxCount = session.usbmuxEvents?.count ?? 0
         var metadata: [String: String] = [
             "opendisplay_session": session.sessionId,
             "origin_ms": String(origin),
             "time_base": "mac_unified_ms",
-            "layout": "frames_ping + per_input",
+            "layout": "frames_ping_heartbeat_usbmux + per_input",
         ]
         if !inputIds.isEmpty { metadata["input_events"] = String(inputIds.count) }
         if !frameIds.isEmpty { metadata["frame_events"] = String(frameIds.count) }
         if !pingIds.isEmpty { metadata["ping_samples"] = String(pingIds.count) }
+        if !hbIds.isEmpty { metadata["heartbeat_samples"] = String(hbIds.count) }
+        if usbmuxCount > 0 { metadata["usbmux_events"] = String(usbmuxCount) }
         return ChromeTraceFile(traceEvents: events, metadata: metadata)
+    }
+
+    private static func minOriginMs(spans: [TraceSpan], session: TraceSession) -> Double {
+        var candidates = spans.map(\.startMs)
+        candidates.append(session.startedAtMs)
+        if let usbmux = session.usbmuxEvents, let first = usbmux.map(\.timeMs).min() {
+            candidates.append(first)
+        }
+        return candidates.min() ?? session.startedAtMs
+    }
+
+    /// Instant events on the usbmuxd track — wall-clock aligned via the same origin.
+    private static func usbmuxInstantEvents(_ events: [UsbmuxLogEvent], origin: Double) -> [ChromeTraceEvent] {
+        events.map { ev in
+            var args: [String: String] = [
+                "dir": ev.direction,
+                "raw": String(ev.raw.prefix(120)),
+            ]
+            if let seq = ev.seq { args["seq"] = String(seq) }
+            if let ack = ev.ack { args["ack"] = String(ack) }
+            if let win = ev.win { args["win"] = String(win) }
+            if let len = ev.len { args["len"] = String(len) }
+            if let sport = ev.sport { args["sport"] = String(sport) }
+            if let dport = ev.dport { args["dport"] = String(dport) }
+            let label = ev.len.map { "usbmux.\(ev.direction) \($0)B" } ?? "usbmux.\(ev.direction)"
+            return ChromeTraceEvent(
+                name: label,
+                cat: TraceRowKind.usbmux,
+                ph: "i",
+                ts: (ev.timeMs - origin) * 1000,
+                dur: nil,
+                pid: pipelinePid,
+                tid: Track.usbmux,
+                args: args)
+        }
     }
 
     /// When `frame.tcp_tx` was missing (legacy ordering bug), infer from send→recv.
@@ -235,6 +306,7 @@ enum TraceExporter {
         }
         name(Track.frames, "frames")
         name(Track.ping, "ping / pong")
+        name(Track.heartbeat, "heartbeat (:+2)")
         for id in Set(spans.filter { $0.rowKind == TraceRowKind.input }.map(\.rowId)).sorted() {
             name(Track.inputBase + id, "input_\(id)")
         }
@@ -255,6 +327,8 @@ enum TraceExporter {
             return "ipad"
         case TracePhase.inputWire:
             return "wire"
+        case TracePhase.heartbeatRtt:
+            return "mac"
         default:
             return "wire"
         }

@@ -8,6 +8,8 @@ final class InputInjector {
 
     /// Wall-clock ms when the last touch/pencil event was injected (Mac clock).
     private(set) var lastInjectMs: Double = 0
+    var isPenDown: Bool { penDown }
+    var isFingerDown: Bool { fingerDown }
 
     private let displayID: CGDirectDisplayID
     private let source: CGEventSource

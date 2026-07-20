@@ -106,9 +106,26 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var traceConnection: NWConnection?
     private let traceQueue = DispatchQueue(label: "sender.trace", qos: .utility)
     private var traceConnectionReady = false
+    private var heartbeatConnection: NWConnection?
+    private let heartbeatQueue = DispatchQueue(label: "sender.heartbeat", qos: .userInteractive)
+    private var heartbeatConnectionReady = false
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video", qos: .userInteractive)
     private let startCode: [UInt8] = [0, 0, 0, 1]
+
+    private func onVideoQueue(_ block: @escaping () -> Void) {
+        queue.async {
+            VideoQueueThread.markSenderVideo()
+            block()
+        }
+    }
+
+    private func onVideoQueueAfter(deadline: DispatchTime, _ block: @escaping () -> Void) {
+        queue.asyncAfter(deadline: deadline) {
+            VideoQueueThread.markSenderVideo()
+            block()
+        }
+    }
 
     private var controlPort: UInt16 {
         switch transport {
@@ -121,6 +138,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private var tracePortNum: UInt16 { WireProtocol.tracePort(controlPort: controlPort) }
+    private var heartbeatPortNum: UInt16 { WireProtocol.heartbeatPort(controlPort: controlPort) }
 
     // The dial target. Written on `queue` only (after init): the controller
     // can migrate a live session between transports via switchTransport.
@@ -238,7 +256,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() async throws {
         stopped = false
-        queue.async { self.connect() }   // dial state lives on `queue`
+        onVideoQueue { self.connect() }   // dial state lives on `queue`
         if !monitorsStarted {
             monitorsStarted = true
             schedulePing()
@@ -467,10 +485,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         connection?.cancel()
         connection = nil
+        heartbeatConnection?.cancel()
+        heartbeatConnection = nil
+        heartbeatConnectionReady = false
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
-        queue.async { [weak self] in
+        onVideoQueue { [weak self] in
             // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
@@ -485,7 +506,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// one and the video resyncs with a keyframe. Which transport to be on
     /// is the controller's call (cable-in upgrade, unplug failover).
     func switchTransport(to newTransport: SenderTransport) {
-        queue.async { [weak self] in
+        onVideoQueue { [weak self] in
             guard let self, !self.stopped else { return }
             let label = if case .usb = newTransport { "USB" } else { "WiFi" }
             Log.info("switching \(self.endpointName) to \(label)")
@@ -501,6 +522,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.traceConnection?.cancel()
             self.traceConnection = nil
             self.traceConnectionReady = false
+            self.heartbeatConnection?.cancel()
+            self.heartbeatConnection = nil
+            self.heartbeatConnectionReady = false
             self.pendingSends = 0
             self.pipelineLock.lock()
             self.pendingEncodes = 0
@@ -512,7 +536,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Drop the current connection and dial again — fresh TCP through the
     /// tunnel, fresh accept on the phone. Bound to the UI Reconnect button.
     func forceReconnect() {
-        queue.async { [weak self] in
+        onVideoQueue { [weak self] in
             guard let self, !self.stopped else { return }
             Log.info("manual reconnect requested")
             self.disconnectedSince = Date()   // fresh grace window
@@ -532,13 +556,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Retry until capture is back (a rebuild during display sleep can fail).
     private func scheduleCaptureRecovery() {
-        queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+        onVideoQueueAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, !self.stopped, self.stream == nil,
                   let hello = self.lastHello else { return }
             Log.info("capture died — rebuilding pipeline")
             Task {
                 await self.reconfigure(hello)
-                self.queue.async {
+                self.onVideoQueue {
                     if self.stream == nil { self.scheduleCaptureRecovery() }
                 }
             }
@@ -576,6 +600,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastReceived = Date()  // fresh grace period for the watchdog
         receiveControl(on: conn)
         connectTracePort()
+        connectHeartbeat()
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
@@ -587,6 +612,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         conn.stateUpdateHandler = { [weak self] state in
+            VideoQueueThread.markSenderVideo()
             guard let self else { return }
             switch state {
             case .ready:
@@ -621,13 +647,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self else { return }
             do {
                 let conn = try await Usbmux.dial(udid: udid, port: port, queue: queue)
-                queue.async {
+                onVideoQueue {
                     guard generation == self.dialGeneration, !self.stopped else {
                         conn.cancel()
                         return
                     }
                     self.connection = conn
                     conn.stateUpdateHandler = { [weak self] state in
+                        VideoQueueThread.markSenderVideo()
                         guard let self else { return }
                         switch state {
                         case .failed(let error):
@@ -654,7 +681,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     Log.info("usb dial failed: \(error)")
                     hint = "USB connection failed: \(error.localizedDescription)"
                 }
-                queue.async {
+                onVideoQueue {
                     guard generation == self.dialGeneration, !self.stopped else { return }
                     Task { await self.status(hint) }
                     self.scheduleReconnect()
@@ -685,11 +712,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         traceConnection?.cancel()
         traceConnection = nil
         traceConnectionReady = false
+        heartbeatConnection?.cancel()
+        heartbeatConnection = nil
+        heartbeatConnectionReady = false
         pendingSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
-        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        onVideoQueueAfter(deadline: .now() + 1.0) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this 1s window supersedes this dial instead of
             // racing it — otherwise the queued connect() re-dials the new
@@ -703,7 +733,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Liveness (ping + watchdog)
 
     private func schedulePing() {
-        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        onVideoQueueAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady {
                 // Liveness + send-side health for the phone's overlay.
@@ -725,7 +755,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func scheduleWatchdog() {
-        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        onVideoQueueAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > 5 {
                 Log.info("watchdog: nothing from the phone for >5s — reconnecting")
@@ -779,6 +809,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func pollCursorPosition() {
+        VideoQueueThread.markSenderVideo()
         guard connectionReady, captureDisplayID != 0,
               let loc = CGEvent(source: nil)?.location else { return }
         let bounds = CGDisplayBounds(captureDisplayID)
@@ -826,7 +857,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             size.width > 0 ? hot.x / size.width : 0,
             size.height > 0 ? hot.y / size.height : 0,
             png.base64EncodedString())
-        queue.async { self.sendJSONFrame(msg) }
+        onVideoQueue { self.sendJSONFrame(msg) }
     }
 
     // MARK: - Trace channel (port controlPort + 1, background queue)
@@ -886,6 +917,107 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    // MARK: - Heartbeat channel (port controlPort + 2, isolated usbmux connection)
+
+    private func connectHeartbeat() {
+        heartbeatConnection?.cancel()
+        heartbeatConnection = nil
+        heartbeatConnectionReady = false
+
+        switch transport {
+        case .tcp(let endpoint):
+            guard case .hostPort(let host, _) = endpoint,
+                  let port = NWEndpoint.Port(rawValue: heartbeatPortNum) else { return }
+            let hbEndpoint = NWEndpoint.hostPort(host: host, port: port)
+            let options = NWProtocolTCP.Options()
+            options.noDelay = true
+            let params = NWParameters(tls: nil, tcp: options)
+            params.serviceClass = .interactiveVideo
+            let conn = NWConnection(to: hbEndpoint, using: params)
+            heartbeatConnection = conn
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.heartbeatConnectionReady = true
+                    self.receiveHeartbeat(on: conn)
+                    self.scheduleHeartbeatSend()
+                    Log.info("[heartbeat] channel ready :\(self.heartbeatPortNum)")
+                case .failed(let error):
+                    Log.info("[heartbeat] channel failed: \(error)")
+                    self.heartbeatConnectionReady = false
+                case .cancelled:
+                    self.heartbeatConnectionReady = false
+                default: break
+                }
+            }
+            conn.start(queue: heartbeatQueue)
+        case .usb(let udid, _):
+            let generation = dialGeneration
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let conn = try await Usbmux.dial(udid: udid, port: self.heartbeatPortNum,
+                                                     queue: self.heartbeatQueue)
+                    self.heartbeatQueue.async {
+                        guard generation == self.dialGeneration, !self.stopped else {
+                            conn.cancel()
+                            return
+                        }
+                        self.heartbeatConnection = conn
+                        self.heartbeatConnectionReady = true
+                        self.receiveHeartbeat(on: conn)
+                        self.scheduleHeartbeatSend()
+                        Log.info("[heartbeat] channel ready (USB :\(self.heartbeatPortNum))")
+                    }
+                } catch {
+                    Log.info("[heartbeat] dial failed: \(error)")
+                }
+            }
+        }
+    }
+
+    private func scheduleHeartbeatSend() {
+        heartbeatQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self, !self.stopped, self.heartbeatConnectionReady else { return }
+            let sendMs = Date().timeIntervalSince1970 * 1000
+            self.sendHeartbeatJSON("{\"type\":\"\(WireHeartbeat.ping)\",\"t\":\(sendMs)}")
+            self.scheduleHeartbeatSend()
+        }
+    }
+
+    private func sendHeartbeatJSON(_ json: String) {
+        guard let conn = heartbeatConnection, let payload = json.data(using: .utf8) else { return }
+        var header = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &header, count: 4)
+        frame.append(payload)
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error { Log.info("[heartbeat] send error: \(error)") }
+        })
+    }
+
+    private func receiveHeartbeat(on conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
+            guard let self, error == nil, let data, data.count == 4 else { return }
+            let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
+            guard len > 0, len < 1 << 16 else { return }
+            conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
+                guard let self, error == nil, let payload, payload.count == len else { return }
+                self.handleHeartbeatPayload(payload)
+                self.receiveHeartbeat(on: conn)
+            }
+        }
+    }
+
+    private func handleHeartbeatPayload(_ payload: Data) {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        if type == WireHeartbeat.pong, let sendMs = obj["t"] as? Double {
+            let recvMs = Date().timeIntervalSince1970 * 1000
+            MacTrace.recordHeartbeatRtt(sendMs: sendMs, recvMs: recvMs)
+        }
+    }
+
     private func receiveTrace(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
             guard let self, error == nil, let data, data.count == 4 else { return }
@@ -940,10 +1072,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func receiveControl(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
+            VideoQueueThread.markSenderVideo()
             guard let self, error == nil, let data, data.count == 4 else { return }
             let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
             guard len > 0, len < 1 << 20 else { return }
             conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
+                VideoQueueThread.markSenderVideo()
                 guard let self, error == nil, let payload, payload.count == len else { return }
                 self.handleControl(payload)
                 self.receiveControl(on: conn)
@@ -952,6 +1086,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func handleControl(_ payload: Data) {
+        VideoQueueThread.markSenderVideo()
         lastReceived = Date()
         guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let type = obj["type"] as? String else {
@@ -959,6 +1094,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         switch type {
+        case WireProtocol.inpSent:
+            if let inpId = obj["inpId"] as? Int, let tSend = obj["tSend"] as? Double {
+                MacTrace.noteInputSent(inputId: inpId, tSendMs: tSend)
+            }
         case "ping":
             // Echo with our clock so the phone can estimate the offset
             // (NTP-style) and compute true end-to-end frame latency.
@@ -1013,12 +1152,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
              WireInput.gesture, WireInput.barrelButton, "scroll":
             logInputWire(obj)
             let inpId = obj["inpId"] as? Int
-            let wireMacMs = obj["t"] as? Double
+            let wireFallbackMs = obj["tSend"] as? Double
+                ?? obj["tHandoff"] as? Double
+                ?? obj["t"] as? Double
             let pencilPhase = obj["phase"] as? String
             let recvMs = Date().timeIntervalSince1970 * 1000
-            if let inpId, let wireMacMs {
-                MacTrace.inputWire(inputId: inpId, wireStartMs: wireMacMs, recvMs: recvMs)
-            }
+            let penDown = inputInjector?.isPenDown ?? false
+            let fingerDown = inputInjector?.isFingerDown ?? false
+            InputRecvSignpost.recvStarted(recvMs: recvMs, type: type, phase: pencilPhase, inpId: inpId,
+                                            penDown: penDown, fingerDown: fingerDown)
+            MacTrace.inputReceived(inputId: inpId, wireFallbackMs: wireFallbackMs, recvMs: recvMs)
             let injectStart = Date().timeIntervalSince1970 * 1000
             inputInjector?.handleControl(obj)
             let injectEnd = Date().timeIntervalSince1970 * 1000
@@ -1029,9 +1172,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             if type == WireInput.pencil {
                 MacTrace.pencilPhaseEnded(phase: pencilPhase)
+                if pencilPhase == "ended" || pencilPhase == "cancelled" {
+                    InputRecvSignpost.endStroke()
+                }
+            } else if type == "touch",
+                      pencilPhase == "ended" || pencilPhase == "cancelled" {
+                InputRecvSignpost.endStroke()
             }
-            if let t = obj["t"] as? Double {
-                let delta = Date().timeIntervalSince1970 * 1000 - t
+            if let t = wireFallbackMs {
+                let delta = recvMs - t
                 if delta > -50, delta < 1000 {
                     inputLatencies.append(max(delta, 0))
                     if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
@@ -1043,6 +1192,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
+            let recvEndMs = Date().timeIntervalSince1970 * 1000
+            InputRecvSignpost.recvEnded(endMs: recvEndMs, type: type, phase: pencilPhase,
+                                        penDown: inputInjector?.isPenDown ?? false,
+                                        fingerDown: inputInjector?.isFingerDown ?? false)
         case "kf":
             // The phone's decoder lost sync (e.g. it attached mid-GOP and
             // periodic keyframes are off) — force an IDR on the next frame.
@@ -1069,7 +1222,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func waitForHello() async throws -> PhoneInfo {
         if let lastHello { return lastHello }
         return try await withCheckedThrowingContinuation { continuation in
-            queue.async {
+            onVideoQueue {
                 if let hello = self.lastHello {
                     continuation.resume(returning: hello)
                 } else {
@@ -1125,6 +1278,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
+        VideoQueueThread.markSenderVideo()
         guard type == .screen,
               CMSampleBufferIsValid(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
