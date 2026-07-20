@@ -413,18 +413,33 @@ final class PhoneReceiver: ObservableObject {
         Log.info("hello sent")
     }
 
-    /// Touch events: x/y normalized [0,1] in video space, origin top-left.
-    /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
-    /// measure touch→injection latency without doing its own clock sync.
-    func sendTouch(phase: String, x: Double, y: Double) {
-        var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
+    func sendTouches(contacts: [WireTouchContact], osMs: Double, captureMs: Double) {
+        guard !contacts.isEmpty else { return }
+        let contactDicts: [[String: Any]] = contacts.map { c in
+            var d: [String: Any] = [
+                "id": c.id,
+                "phase": c.phase.rawValue,
+                "x": c.x,
+                "y": c.y,
+            ]
+            if let major = c.major { d["major"] = major }
+            return d
+        }
+        var msg: [String: Any] = [
+            "type": WireInput.touches,
+            "phase": wirePhase(for: contacts),
+            "contacts": contactDicts,
+        ]
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
     }
 
-    /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
-    func sendScroll(dx: Double, dy: Double) {
-        sendControl(["type": "scroll", "dx": dx, "dy": dy])
+    private func wirePhase(for contacts: [WireTouchContact]) -> String {
+        if contacts.contains(where: { $0.phase == .began }) { return "began" }
+        if contacts.contains(where: { $0.phase == .ended || $0.phase == .cancelled }) {
+            return "ended"
+        }
+        return "moved"
     }
 
     func sendPencil(phase: PencilPhase, x: Double, y: Double,

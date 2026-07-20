@@ -75,7 +75,7 @@ struct ReceiverScreen: View {
                     VideoLayerView(displayLayer: model.receiver.displayLayer,
                                    receiver: model.receiver,
                                    useMetal: metalRenderer)
-                        .id(metalRenderer)   // rebuild the layer tree on toggle
+                        .id(metalRenderer)
                         .ignoresSafeArea()
                     if showAnalytics {
                         VStack {
@@ -84,7 +84,7 @@ struct ReceiverScreen: View {
                                         videoSize: model.receiver.videoSize)
                                 .padding(.bottom, 10)
                         }
-                        .allowsHitTesting(false)   // never block touch input
+                        .allowsHitTesting(false)
                     }
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
@@ -315,8 +315,6 @@ struct PerfOverlay: View {
                     metric("photon", String(format: "%.0f ms", stats.photonP50))
                 }
                 if stats.inputP50 > 0 {
-                    // touch→CGEvent on the Mac; full touch-to-photon adds
-                    // the render+capture wait and one e2e on top.
                     metric("input", String(format: "%.0f ms", stats.inputP50))
                 }
                 metric("rtt", String(format: "%.0f ms", stats.rttMs))
@@ -500,7 +498,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Analytics")
                 } footer: {
-                    Text("The overlay shows FPS, bitrate, frame timing, stalls, and latency graphs at the bottom of the screen while streaming. The experimental Metal renderer decodes and presents frames manually — it adds decode and true on-glass latency metrics to the overlay, but in our measurements the system video layer displays frames faster. Leave it off unless you're debugging.")
+                    Text("The overlay shows FPS, bitrate, frame timing, stalls, and latency graphs at the bottom of the screen while streaming.")
                 }
 
                 Section {
@@ -522,7 +520,7 @@ struct SettingsView: View {
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rectangle.portrait.rotate")
-                    Label("Touch: tap to click, drag to drag, two-finger pan to scroll.",
+                    Label("Touch: one finger to click/drag; two/three-finger tap for undo/redo. Apple Pencil draws with pressure and tilt; hover moves the cursor.",
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
@@ -636,21 +634,22 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
+        view.inputEngine.onTouches = { [weak receiver] contacts, osMs, captureMs in
+            receiver?.sendTouches(contacts: contacts, osMs: osMs, captureMs: captureMs)
+        }
         view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude, rotation, osMs, captureMs in
             receiver?.sendPencil(phase: phase, x: x, y: y,
                                  pressure: pressure, azimuth: azimuth,
                                  altitude: altitude, rotation: rotation,
                                  osMs: osMs, captureMs: captureMs)
         }
+        view.inputEngine.onProximity = { [weak receiver] entering, eraser in
+            receiver?.sendProximity(entering: entering, eraser: eraser)
+        }
         view.inputEngine.onBarrelButton = { [weak receiver] down, x, y in
             receiver?.sendBarrelButton(down: down, x: x, y: y)
         }
         view.inputEngine.install(on: view)
-
-        let pan = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
-        pan.minimumNumberOfTouches = 2
-        pan.maximumNumberOfTouches = 2
-        view.addGestureRecognizer(pan)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -756,7 +755,10 @@ struct VideoLayerView: UIViewRepresentable {
                                            y: rect.minY + cursorNorm.y * rect.height)
         }
 
-        // Map view coords into the displayed video rect; reject outside points.
+        // The video is aspect-fit inside the view; map view coords into the
+        // displayed video rect and normalize to [0,1]. Reject points outside
+        // the rect — do not clamp (sidebar fingers leak into allTouches with
+        // negative x and would otherwise snap to the left edge).
         fileprivate func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
             guard let rect = videoRect() else { return nil }
             guard rect.contains(point) else { return nil }
@@ -765,102 +767,21 @@ struct VideoLayerView: UIViewRepresentable {
             return (x, y)
         }
 
-        private func isFinger(_ touch: UITouch) -> Bool {
-            switch touch.type {
-            case .direct: return true
-            default:
-                if #available(iOS 17.0, *), touch.type == .indirectPointer { return true }
-                return false
-            }
-        }
-
-        private func isPencil(_ touch: UITouch) -> Bool {
-            switch touch.type {
-            case .pencil, .stylus: return true
-            default: return false
-            }
-        }
-
-        private var twoFingerActive = false
-        private var lastPan = CGPoint.zero
-        private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
-
-        @objc func didTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-            guard let video = receiver?.videoSize, video != .zero else { return }
-            switch recognizer.state {
-            case .began:
-                twoFingerActive = true
-                lastPan = .zero
-            case .changed:
-                let t = recognizer.translation(in: self)
-                let scale = min(bounds.width / video.width, bounds.height / video.height)
-                // Deltas in video pixels, natural-scrolling direction.
-                receiver?.sendScroll(dx: (t.x - lastPan.x) / scale,
-                                     dy: (t.y - lastPan.y) / scale)
-                lastPan = t
-            default:
-                twoFingerActive = false
-            }
-        }
-
-        private func send(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
-            let fingers = touches.filter { isFinger($0) }
-            guard !fingers.isEmpty else { return }
-            // Ignore single-finger events while a two-finger gesture runs,
-            // and end the click if a second finger joins mid-press.
-            if twoFingerActive || (event?.allTouches?.filter { isFinger($0) }.count ?? 1) > 1 {
-                if phase != "began" {
-                    receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
-                }
-                return
-            }
-            guard let touch = fingers.first,
-                  let norm = normalized(touch.location(in: self)) else { return }
-            lastNorm = norm
-            if phase == "moved", let event {
-                // The panel samples touches at 120Hz but UIKit delivers at
-                // display refresh — forward every coalesced sample so the Mac
-                // gets the full-rate drag, then UIKit's predicted touch so the
-                // cursor leads toward where the finger will be (~1 frame of
-                // perceived latency back; corrected by the next real sample).
-                for t in event.coalescedTouches(for: touch) ?? [touch] {
-                    if let n = normalized(t.location(in: self)) {
-                        lastNorm = n
-                        receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
-                    }
-                }
-                if let predicted = event.predictedTouches(for: touch)?.last,
-                   let n = normalized(predicted.location(in: self)) {
-                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
-                }
-                return
-            }
-            receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
-        }
-
-        private func routeTouches(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?, ended: Bool) {
-            let osMs = Date().timeIntervalSince1970 * 1000
-            let pencil = touches.filter { isPencil($0) }
-            let finger = touches.filter { isFinger($0) }
-            if !pencil.isEmpty {
-                inputEngine.handle(pencil, event: event, phase: phase, ended: ended, osDeliveredMs: osMs)
-            }
-            if !finger.isEmpty {
-                send(phase, finger, event)
-            }
-        }
-
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-            routeTouches("began", touches, event, ended: false)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "began", ended: false, osDeliveredMs: osMs)
         }
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-            routeTouches("moved", touches, event, ended: false)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "moved", ended: false, osDeliveredMs: osMs)
         }
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-            routeTouches("ended", touches, event, ended: true)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "ended", ended: true, osDeliveredMs: osMs)
         }
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-            routeTouches("cancelled", touches, event, ended: true)
+            let osMs = Date().timeIntervalSince1970 * 1000
+            inputEngine.handle(touches, event: event, phase: "cancelled", ended: true, osDeliveredMs: osMs)
         }
     }
 }
