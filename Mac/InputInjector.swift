@@ -20,6 +20,8 @@ final class InputInjector {
     private var eraser = false
     /// True when the current pen contact is a zero-pressure tap (mouse, not tablet).
     private var pencilTapMode = false
+    /// Last on-display point from touch effects (warp / press / drag).
+    private var lastGesturePoint: CGPoint?
 
     private let touchRecognizer: TouchGestureRecognizer
     private let touchSink: InputInjectorTouchSink
@@ -203,14 +205,22 @@ final class InputInjector {
         switch effect {
         case .pressLeft(let x, let y):
             touchLeftDown = true
-            postMouse(type: .leftMouseDown, at: screenPoint(nx: x, ny: y), button: .left)
+            let p = screenPoint(nx: x, ny: y)
+            lastGesturePoint = p
+            postMouse(type: .leftMouseDown, at: p, button: .left)
         case .dragLeft(let x, let y):
-            postMouse(type: .leftMouseDragged, at: screenPoint(nx: x, ny: y), button: .left)
+            let p = screenPoint(nx: x, ny: y)
+            lastGesturePoint = p
+            postMouse(type: .leftMouseDragged, at: p, button: .left)
         case .releaseLeft(let x, let y):
             touchLeftDown = false
-            postMouse(type: .leftMouseUp, at: screenPoint(nx: x, ny: y), button: .left)
+            let p = screenPoint(nx: x, ny: y)
+            lastGesturePoint = p
+            postMouse(type: .leftMouseUp, at: p, button: .left)
         case .warpCursor(let x, let y):
-            postMouse(type: .mouseMoved, at: screenPoint(nx: x, ny: y), button: .left)
+            let p = screenPoint(nx: x, ny: y)
+            lastGesturePoint = p
+            postMouse(type: .mouseMoved, at: p, button: .left)
         case .magnify(let amount, let phase):
             postMagnify(amount: amount, phase: phase)
         case .rotate(let degrees, let phase):
@@ -313,23 +323,34 @@ final class InputInjector {
         CGEventField(rawValue: UInt32(raw))!
     }
 
-    private func nsPhase(_ phase: TouchGesturePhase) -> Int64 {
+    private func hidPhase(_ phase: TouchGesturePhase) -> Int64 {
+        // IOHID/NSEvent gesture phases are bit flags: began=1, changed=2, ended=4.
+        // We previously sent changed=4 (ended) and ended=8 (cancelled), so Preview
+        // terminated the pinch after the first delta — one discrete zoom step.
         switch phase {
         case .began: return 1
-        case .changed: return 4
-        case .ended: return 8
+        case .changed: return 2
+        case .ended: return 4
         }
     }
 
     private func postMagnify(amount: Double, phase: TouchGesturePhase) {
+        // Preview zooms on trackpad magnify (type 29, subtype 8), not Cmd/Ctrl+scroll.
+        let p = lastGesturePoint ?? currentCursor()
+        if phase == .began {
+            CGWarpMouseCursorPosition(p)
+        }
         guard let event = CGEvent(source: source) else { return }
         event.type = Self.gestureEventType
+        event.location = p
         event.setIntegerValueField(gestureField(GestureEventField.subtype.rawValue),
                                    value: GestureSubtype.magnify.rawValue)
         event.setIntegerValueField(gestureField(GestureEventField.phase.rawValue),
-                                   value: nsPhase(phase))
-        event.setDoubleValueField(gestureField(GestureEventField.value.rawValue), value: amount)
-        event.post(tap: .cghidEventTap)
+                                   value: hidPhase(phase))
+        let value = phase == .changed ? amount : 0
+        event.setDoubleValueField(gestureField(GestureEventField.value.rawValue), value: value)
+        event.flags = .maskNonCoalesced
+        event.post(tap: .cgSessionEventTap)
     }
 
     private func postRotate(degrees: Double, phase: TouchGesturePhase) {
@@ -338,9 +359,9 @@ final class InputInjector {
         event.setIntegerValueField(gestureField(GestureEventField.subtype.rawValue),
                                    value: GestureSubtype.rotate.rawValue)
         event.setIntegerValueField(gestureField(GestureEventField.phase.rawValue),
-                                   value: nsPhase(phase))
+                                   value: hidPhase(phase))
         event.setDoubleValueField(gestureField(GestureEventField.value.rawValue), value: degrees)
-        event.post(tap: .cghidEventTap)
+        event.post(tap: .cgSessionEventTap)
     }
 
     private func postScrollPhased(dx: Double, dy: Double, phase: TouchGesturePhase) {

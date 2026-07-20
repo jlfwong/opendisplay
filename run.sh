@@ -17,10 +17,13 @@ fi
 if pgrep -xq OpenDisplay; then
   echo "Stopping existing OpenDisplay instance(s)…"
   killall OpenDisplay 2>/dev/null || true
-  sleep 1
+  sleep 2
 fi
 
 open "$APP"
+sleep 1
 echo "OpenDisplay running from: $APP"
+echo "Started: $(date)"
+echo "PID: $(pgrep OpenDisplay)"
 echo "Bundle: $(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Contents/Info.plist")"
 echo "Logs at /tmp/opensidecar-mac.log."

@@ -122,6 +122,8 @@ final class TouchGestureRecognizer {
     private var interactionStart: TimeInterval?
     private var interactionPeakFingers = 0
     private var interactionManipulated = false
+    /// Finger count at end of the previous frame (for 1→2 transition detection).
+    private var lastFingerCount = 0
 
     init(config: TouchGestureConfig, sink: TouchGestureSink) {
         self.config = config
@@ -136,6 +138,7 @@ final class TouchGestureRecognizer {
         interactionStart = nil
         interactionPeakFingers = 0
         interactionManipulated = false
+        lastFingerCount = 0
         resetMultiGestureState(finalize: true)
     }
 
@@ -155,14 +158,24 @@ final class TouchGestureRecognizer {
             emitted = true
         }
 
-        let prevActiveCount = activeContactCount()
+        let prevActiveCount = lastFingerCount
 
         // A new `.began` for an id we weren't tracking means a fresh touch
         // sequence — purge stale contacts that would otherwise make this look
         // like a two-finger gesture (the #1 cause of single-finger taps doing
         // nothing: pressLeft never fires, only warpCursor / scroll / magnify).
+        // Do NOT purge when a second finger joins an active touch: the existing
+        // tracked id(s) are still present in this frame.
         for contact in frame.contacts where contact.phase == .began {
             guard tracked[contact.id] == nil, !tracked.isEmpty else { continue }
+            let liveFrameIds = Set(
+                frame.contacts
+                    .filter { $0.phase != .ended && $0.phase != .cancelled }
+                    .map(\.id)
+            )
+            if tracked.keys.contains(where: { liveFrameIds.contains($0) }) {
+                continue
+            }
             if leftDown, let t = tracked.values.first {
                 emit(.releaseLeft(x: t.lastX, y: t.lastY))
             }
@@ -195,6 +208,9 @@ final class TouchGestureRecognizer {
         if prevActiveCount == 1 && fingerCount >= 2 {
             retractSinglePress(emit: emit)
             suppressSinglePress = true
+            // Second finger landing inflates cumulative separation vs travel;
+            // reset pair baselines so pan/pinch lock reflects movement, not pose.
+            resetPairBaselines()
             let cx = active.reduce(0.0) { $0 + $1.x } / Double(active.count)
             let cy = active.reduce(0.0) { $0 + $1.y } / Double(active.count)
             emit(.warpCursor(x: cx, y: cy))
@@ -230,6 +246,10 @@ final class TouchGestureRecognizer {
         }
 
         for contact in frame.contacts where contact.phase == .moved || contact.phase == .began || contact.phase == .ended {
+            if tracked[contact.id] == nil,
+               contact.phase != .ended && contact.phase != .cancelled {
+                tracked[contact.id] = TrackedTouch(id: contact.id, lastX: contact.x, lastY: contact.y)
+            }
             guard var t = tracked[contact.id] else { continue }
             t.lastX = contact.x
             t.lastY = contact.y
@@ -239,6 +259,8 @@ final class TouchGestureRecognizer {
         for contact in frame.contacts where contact.phase == .ended || contact.phase == .cancelled {
             tracked.removeValue(forKey: contact.id)
         }
+
+        lastFingerCount = activeContacts(from: frame.contacts).count
 
         return emitted
     }
@@ -336,6 +358,12 @@ final class TouchGestureRecognizer {
                 case .rotate: kind = .rotate
                 case .scroll: kind = .scroll
                 }
+            } else if travel >= separationChange {
+                lockedGesture = .scroll
+                kind = .scroll
+            } else if separationChange > travel {
+                lockedGesture = .pinch
+                kind = .pinch
             } else {
                 kind = classifyGesture(
                     distDelta: distDelta,
@@ -343,6 +371,12 @@ final class TouchGestureRecognizer {
                     angleDelta: prevPairAngle.map { angle - $0 },
                     separation: distance
                 )
+                switch kind {
+                case .pinch: lockedGesture = .pinch
+                case .rotate: lockedGesture = .rotate
+                case .scroll: lockedGesture = .scroll
+                case .none: break
+                }
             }
 
             switch kind {
@@ -397,6 +431,9 @@ final class TouchGestureRecognizer {
                                centDelta: Double,
                                angleDelta: Double?,
                                separation: Double) -> ClassifiedGesture {
+        if centDelta > 0 && centDelta >= abs(distDelta) {
+            return .scroll
+        }
         if abs(distDelta) > config.pinchDistanceThreshold
             && abs(distDelta) > centDelta * 0.6 {
             return .pinch
@@ -448,7 +485,7 @@ final class TouchGestureRecognizer {
     }
 
     private func retractSinglePress(emit: (TouchGestureEffect) -> Void) {
-        guard leftDown, let t = tracked.values.first else { return }
+        guard leftDown, let t = tracked.values.min(by: { $0.id < $1.id }) else { return }
         emit(.releaseLeft(x: t.lastX, y: t.lastY))
         leftDown = false
     }
@@ -464,6 +501,15 @@ final class TouchGestureRecognizer {
             emit(.rotate(degrees: 0, phase: .ended))
         }
         resetMultiGestureState(finalize: false)
+    }
+
+    private func resetPairBaselines() {
+        prevPairDistance = nil
+        prevPairAngle = nil
+        scrollPrevCentroid = nil
+        pairStartCentroid = nil
+        pairStartDistance = nil
+        pairStartAngle = nil
     }
 
     private func resetMultiGestureState(finalize: Bool) {
