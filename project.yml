@@ -133,3 +133,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.paintingmirror.sender
+          BUNDLE_DISPLAY_NAME: OpenDisplay Dev

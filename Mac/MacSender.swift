@@ -96,12 +96,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // recording indicator all torn down) instead of dialing forever or
     // silently coming back over a different transport.
     @MainActor var onDisconnected: (() -> Void)?
-    // Fired when the receiver announces its device locked. The controller
-    // ends this session — an invisible display strands the cursor — and
-    // starts a fresh one that waits for the wake.
     @MainActor var onPeerSleeping: (() -> Void)?
-    // Fired when the receiver announces the app is quitting: deliberate,
-    // so the controller ends the session without arming a reconnect.
     @MainActor var onPeerClosed: (() -> Void)?
     // Fired on every hello — carries the receiver's install id so the
     // controller can deduplicate USB/WiFi sessions to the same device.
@@ -111,7 +106,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
-    private let queue = DispatchQueue(label: "sender.video")
+    private let queue = DispatchQueue(label: "sender.video", qos: .userInteractive)
+    private func onVideoQueue(_ block: @escaping () -> Void) {
+        queue.async {
+            VideoQueueThread.markSenderVideo()
+            block()
+        }
+    }
+
+    private func onVideoQueueAfter(deadline: DispatchTime, _ block: @escaping () -> Void) {
+        queue.asyncAfter(deadline: deadline) {
+            VideoQueueThread.markSenderVideo()
+            block()
+        }
+    }
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -127,30 +135,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // ── Encoder parallelism limiter (maxPendingEncodes = 1) ─────────────────
     //
     // VTCompressionSessionEncodeFrame returns immediately; the hardware H.264
-    // encoder runs asynchronously. If ScreenCaptureKit delivers the next frame
-    // before the previous encode callback fires, VideoToolbox will run multiple
-    // encodes in parallel inside the same session.
-    //
-    // Capping pendingEncodes at 1 enforces “latest frame wins” on the encoder:
-    // skip captures while an encode is in flight (enc drops), then feed the next
-    // fresh buffer when the callback clears the slot. The H.264 reference chain
-    // stays valid (pre-encode skip → normal P-frame n→n+2); we do NOT force
-    // keyframes on enc drops.
+    // encoder runs asynchronously. Capping pendingEncodes at 1 enforces
+    // “latest frame wins” on the encoder. Separate from network backpressure
+    // (maxPendingSends): enc drops mean “encoder busy”; net drops mean “TCP
+    // send queue full”.
     private var pendingEncodes = 0
     private let maxPendingEncodes = 1
-
-    // ── Outstanding send backpressure (maxPendingSends = 3) ──────────────────
-    //
-    // pendingSends counts video frames whose NWConnection.send completion has
-    // not fired yet — i.e. bytes still in flight / waiting on TCP ACKs. Allow a
-    // small pipeline (3) so the link is not idle between ACKs; unlike the encoder,
-    // a few outstanding sends helps throughput without piling up seconds of lag.
-    //
-    // When pendingSends hits the cap we skip the capture before encode (net
-    // drops). Same drop point as enc drops, but means “TCP send queue full”, not
-    // “encoder busy” — split counters (enc↓ vs net↓) so the HUD shows which
-    // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
-    // VT work on frames that would only add latency.
     private var pendingSends = 0
     private let maxPendingSends = 3
     private let pipelineLock = NSLock()
@@ -181,22 +171,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
     private var lastReceived = Date()
+    private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
 
-    // Session created after the receiver went to sleep: it refuses
-    // connections until its screen is back, so dial failures mean "asleep",
-    // not "app closed" — surface that instead of the usual hints. Cleared by
-    // the first successful connection.
     private var awaitingWake: Bool
-
-    // Consecutive actively-refused dials on a previously connected session.
-    // Refusal is unambiguous: the device is reachable but nothing listens,
-    // so the app was quit (a suspended app's kernel still accepts, and a
-    // network blip times out instead of refusing). Three in a row (~3s)
-    // ends the session early; the full 10s grace stays reserved for the
-    // ambiguous failure kinds.
     private var consecutiveRefusals = 0
     private let refusalsBeforeGivingUp = 3
-    private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
+    private var goneReported = false
 
     // Local cursor echo: a cursor baked into the video carries the full
     // capture→encode→stream→display latency (~30ms perceived). Instead we
@@ -226,6 +206,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // watchdog redials, so it needs the same treatment. Detail is the byte
     // count of the last message that would not parse.
     private var unparseableControlLogPolicy = ThrottledLogPolicy<Int>()
+    /// Inject → next ScreenCaptureKit frame (Mac app render + compositor).
+    private var paintWaitWindow: [Double] = []
     // Capture cadence: SCK only emits on content change, so the phone can't
     // tell "Mac rendered 45fps" from "frames got lost" — count deliveries here.
     private var capFrames = 0
@@ -257,7 +239,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() async throws {
         stopped = false
-        queue.async { self.connect() }   // dial state lives on `queue`
+        onVideoQueue { self.connect() }   // dial state lives on `queue`
         if !monitorsStarted {
             monitorsStarted = true
             schedulePing()
@@ -290,7 +272,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
 
         case .extend:
-            // awaitingWake is queue-confined — read it there before surfacing.
             queue.async { [weak self] in
                 guard let self else { return }
                 let text = self.awaitingWake
@@ -532,12 +513,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    // The controller's end() is idempotent, but several detectors (grace,
-    // refusals, service withdrawal) can conclude "gone" repeatedly while the
-    // stop is in flight — report once so the log tells the story once.
-    private var goneReported = false
-
-    /// Declare the device gone and end the session (must be called on `queue`).
     private func reportGone(_ reason: String) {
         guard !goneReported, !stopped else { return }
         goneReported = true
@@ -545,9 +520,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { @MainActor in self.onDisconnected?() }
     }
 
-    /// A dial was actively refused (must be called on `queue`). On a session
-    /// that has streamed before, enough refusals in a row prove the receiver
-    /// app is gone — end now instead of waiting out the grace.
     private func dialRefused() {
         guard everConnected, !stopped else { return }
         consecutiveRefusals += 1
@@ -556,12 +528,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// The receiver's Bonjour advertisement disappeared (the system
-    /// deregisters a dead app's service within ~1s, while a suspended app
-    /// keeps it). Only meaningful once the connection is already down —
-    /// a live connection outranks a flapping mDNS cache. Together they
-    /// prove a WiFi receiver quit, where dials just stall instead of
-    /// being refused.
     func peerServiceWithdrawn() {
         queue.async { [weak self] in
             guard let self, !self.stopped, self.everConnected,
@@ -645,21 +611,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         let params = NWParameters(tls: nil, tcp: options)
+        params.serviceClass = .interactiveVideo
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
-        // A dial to a withdrawn Bonjour service (receiver asleep or app
-        // closed) sits in .preparing forever — it neither fails nor resolves
-        // when the service later returns, observed on macOS 26. Give every
-        // dial a deadline and redial fresh: a new NWConnection re-runs
-        // Bonjour resolution, so the retry loop reaches the receiver the
-        // moment it advertises again.
-        let generation = dialGeneration
-        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
-            guard let self, generation == self.dialGeneration, !self.stopped,
-                  self.connection === conn, conn.state != .ready else { return }
-            Log.info("dial timed out in \(conn.state) — redialing")
-            self.scheduleReconnect()
-        }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
@@ -673,13 +627,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 self.scheduleReconnect()
             case .waiting(let error):
-                // On loopback there is no "path change" to wake us up again
-                // (e.g. a manual -host tunnel not started yet) — treat
-                // waiting as failure and poll by reconnecting.
                 Log.info("connection waiting: \(error) — will retry")
                 self.connectionReady = false
-                // Read the queue-confined flag here (handler runs on queue),
-                // not inside the detached status Task.
                 let text = self.awaitingWake
                     ? "\(self.endpointName) is asleep — reconnects when it wakes…"
                     : "Waiting for receiver at \(self.endpointName)…"
@@ -725,23 +674,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.becomeReady(conn)
                 }
             } catch {
+                // Distinct guidance per failure: cable missing vs app closed.
+                let hint: String
+                switch error as? Usbmux.Failure {
+                case .noDevice:
+                    hint = "Waiting for a USB device — plug in the iPhone or iPad…"
+                case .refused:
+                    self.dialRefused()
+                    hint = self.awaitingWake
+                        ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                        : "Device found — open the OpenDisplay app on it…"
+                default:
+                    Log.info("usb dial failed: \(error)")
+                    hint = "USB connection failed: \(error.localizedDescription)"
+                }
                 queue.async {
                     guard generation == self.dialGeneration, !self.stopped else { return }
-                    // Distinct guidance per failure: cable missing vs app
-                    // closed. Composed on `queue`: awaitingWake lives there.
-                    let hint: String
-                    switch error as? Usbmux.Failure {
-                    case .noDevice:
-                        hint = "Waiting for a USB device — plug in the iPhone or iPad…"
-                    case .refused:
-                        self.dialRefused()
-                        hint = self.awaitingWake
-                            ? "\(self.endpointName) is asleep — reconnects when it wakes…"
-                            : "Device found — open the OpenDisplay app on it…"
-                    default:
-                        Log.info("usb dial failed: \(error)")
-                        hint = "USB connection failed: \(error.localizedDescription)"
-                    }
                     Task { await self.status(hint) }
                     self.scheduleReconnect()
                 }
@@ -785,10 +733,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Liveness (ping + watchdog)
 
     private func schedulePing() {
-        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        onVideoQueueAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady {
-                // Liveness + send-side health for the phone's overlay.
                 let elapsed = Date().timeIntervalSince(self.capWindowStart)
                 let capFps = elapsed > 0 ? Int(Double(self.capFrames) / elapsed) : 0
                 self.capFrames = 0
@@ -796,7 +743,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                let paintSorted = self.paintWaitWindow.sorted()
+                let paint50 = paintSorted.isEmpty ? 0 : paintSorted[paintSorted.count / 2].rounded()
+                let paint95 = paintSorted.isEmpty ? 0 : paintSorted[min(paintSorted.count - 1, Int(Double(paintSorted.count) * 0.95))].rounded()
+                self.paintWaitWindow.removeAll(keepingCapacity: true)
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"paint50\":\(paint50),\"paint95\":\(paint95),\"capFps\":\(capFps)}")
             }
             self.schedulePing()
         }
@@ -806,25 +757,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > 5 {
-                // A suspended receiver app (user switched apps) goes silent
-                // like this while its kernel still accepts redials — the
-                // session and display are kept on purpose so the user's
-                // window arrangement survives until they come back. Genuine
-                // network loss fails the redials and ends via the grace.
                 Log.info("watchdog: nothing from the phone for >5s — reconnecting")
-                // Can't tell a backgrounded receiver from a brief stall here
-                // (both go silent while redials still succeed) — hedge.
-                Task { await self.status("\(self.endpointName) is silent — keeping the display (app in background or brief stall)") }
+                Task { await self.status("Connection stale — reconnecting…") }
                 self.scheduleReconnect()
-            }
-            // The disconnect grace is otherwise only evaluated when a dial
-            // changes state — a dial stuck in .preparing (withdrawn Bonjour
-            // service) would keep a dead session's display up forever.
-            // Enforce it from here too, where the clock always ticks.
-            if !self.connectionReady, self.everConnected,
-               let since = self.disconnectedSince,
-               Date().timeIntervalSince(since) > self.disconnectGraceSeconds {
-                self.reportGone("device gone for >\(Int(self.disconnectGraceSeconds))s — ending session")
             }
             // A reconnect on a static screen produces no capture frames, so
             // the receiver would stay black — replay the last frame as IDR.
@@ -999,62 +934,30 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
             }
-        case "touch":
-            if let phase = obj["phase"] as? String,
-               let x = obj["x"] as? Double,
-               let y = obj["y"] as? Double {
-                inputInjector?.handleTouch(phase: phase, x: x, y: y)
-                if let t = obj["t"] as? Double {
-                    let delta = Date().timeIntervalSince1970 * 1000 - t
-                    if delta > -50, delta < 1000 {
-                        inputLatencies.append(max(delta, 0))
-                        if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
-                    }
-                }
+        case WireInput.touches, WireInput.pencil, WireInput.proximity, WireInput.barrelButton:
+            let phase = obj["phase"] as? String
+            dispatchInput(type: type, phase: phase, obj: obj) {
+                self.inputInjector?.handleControl(obj)
             }
-        case "scroll":
-            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                inputInjector?.handleScroll(dx: dx, dy: dy)
+            recordInputLatency(obj)
+        case WireProtocol.inpSent:
+            break
+        case WireInput.key:
+            if let keyCode = obj["keyCode"] as? Int {
+                let down = (obj["down"] as? Bool) ?? false
+                inputInjector?.handleKey(keyCode: UInt16(keyCode), down: down)
             }
-        case "pencil":
-            if let phase = obj["phase"] as? String,
-               let x = obj["x"] as? Double,
-               let y = obj["y"] as? Double {
-                inputInjector?.handlePencil(
-                    phase: phase, x: x, y: y,
-                    pressure: obj["pressure"] as? Double ?? 0,
-                    azimuth: obj["azimuth"] as? Double ?? 0,
-                    altitude: obj["altitude"] as? Double ?? (.pi / 2),
-                    rotation: obj["rotation"] as? Double ?? 0)
-                if let t = obj["t"] as? Double {
-                    let delta = Date().timeIntervalSince1970 * 1000 - t
-                    if delta > -50, delta < 1000 {
-                        inputLatencies.append(max(delta, 0))
-                        if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
-                    }
-                }
-            }
-        case "proximity":
-            if let entering = obj["entering"] as? Bool,
-               let x = obj["x"] as? Double,
-               let y = obj["y"] as? Double {
-                inputInjector?.handleProximity(entering: entering, x: x, y: y)
+        case WireInput.shortcut:
+            if let action = obj["action"] as? String {
+                inputInjector?.handleShortcut(action: action)
             }
         case "kf":
-            // The phone's decoder lost sync (e.g. it attached mid-GOP and
-            // periodic keyframes are off) — force an IDR on the next frame.
             Log.info("phone requested keyframe")
             needsKeyframe = true
         case WireMessage.sleeping:
-            // The device locked and is about to close on us. Hand the
-            // session to the controller right away: it tears the virtual
-            // display down (returning the cursor to a visible screen) and
-            // starts a wake-waiting replacement session.
             Log.info("receiver went to sleep — ending session, reconnect armed for wake")
             Task { @MainActor in self.onPeerSleeping?() }
         case WireMessage.closing:
-            // The app on the device is quitting for real — end the session
-            // without the silence grace and without waiting for a wake.
             Log.info("receiver app closed — ending session")
             Task { @MainActor in self.onPeerClosed?() }
         default:
@@ -1071,6 +974,33 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             case .none:
                 break
             }
+        }
+    }
+
+    private func recordInputLatency(_ obj: [String: Any]) {
+        if let t = obj["t"] as? Double {
+            let delta = Date().timeIntervalSince1970 * 1000 - t
+            if delta > -50, delta < 1000 {
+                inputLatencies.append(max(delta, 0))
+                if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
+            }
+        }
+    }
+
+    private func dispatchInput(type: String, phase: String?, obj: [String: Any], work: () -> Void) {
+        let recvMs = Date().timeIntervalSince1970 * 1000
+        let inpId = obj["inpId"] as? Int
+        let penDown = inputInjector?.isPenDown ?? false
+        let fingerDown = inputInjector?.isFingerDown ?? false
+        InputRecvSignpost.recvStarted(recvMs: recvMs, type: type, phase: phase, inpId: inpId,
+                                        penDown: penDown, fingerDown: fingerDown)
+        work()
+        let endMs = Date().timeIntervalSince1970 * 1000
+        InputRecvSignpost.recvEnded(endMs: endMs, type: type, phase: phase,
+                                    penDown: inputInjector?.isPenDown ?? false,
+                                    fingerDown: inputInjector?.isFingerDown ?? false)
+        if phase == "ended" || phase == "cancelled" || phase == "up" {
+            InputRecvSignpost.endStroke()
         }
     }
 
@@ -1141,19 +1071,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastPixelBuffer = pixelBuffer
         lastCaptureAt = Date()
         capFrames += 1
+        let capturedAtMs = Date().timeIntervalSince1970 * 1000
+        if let inj = inputInjector?.lastInjectMs {
+            let wait = capturedAtMs - inj
+            if wait >= 0, wait < 200 {
+                paintWaitWindow.append(wait)
+                if paintWaitWindow.count > 240 { paintWaitWindow.removeFirst(120) }
+            }
+        }
 
-        // No receiver, or a pipeline stage is backed up: skip this frame.
+        // No receiver, or the socket is backed up: skip this frame entirely.
         guard connectionReady else { return }
-        if shouldDropFrame(reason: "pending_encode") { return }  // encoder busy
-        if shouldDropFrame(reason: "pending_sends") { return }   // TCP send queue full
+        if shouldDropFrame(reason: "pending_encode") { return }
+        if shouldDropFrame(reason: "pending_sends") { return }
 
         encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
     }
 
-    /// Drop when encode or send pipeline is busy.
-    /// Pre-encode drops are invisible to the decoder — the H.264 reference
-    /// chain stays intact, so the next frame can be a normal P-frame (n → n+2).
-    /// Do NOT force keyframes here; that causes IDR pulsing / blockiness.
     private func shouldDropFrame(reason: String) -> Bool {
         pipelineLock.lock()
         let drop: Bool

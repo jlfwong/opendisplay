@@ -37,6 +37,11 @@ struct PerfStats: Equatable {
     var macPending = 0           // Mac send queue depth right now
     var inputP50 = 0.0           // touch sent → CGEvent injected on the Mac, ms
     var inputP95 = 0.0
+    var macPaintP50 = 0.0        // Mac inject → ScreenCaptureKit frame
+    var macPaintP95 = 0.0
+    var strokeP50 = 0.0          // pen on glass → iPad display
+    var strokeP95 = 0.0
+    var strokeSamples: [Double] = []
     var capFps = 0               // frames ScreenCaptureKit delivered on the Mac
     // Metal renderer path only:
     var decodeP50 = 0.0          // VTDecompressionSession decode, ms
@@ -102,6 +107,18 @@ final class PhoneReceiver: ObservableObject {
     private var macInputP50 = 0.0
     private var macInputP95 = 0.0
     private var macCapFps = 0
+    private var macPaintP50 = 0.0
+    private var macPaintP95 = 0.0
+
+    private struct PendingPenSample {
+        let devMs: Double
+        let macMs: Double
+        var matched = false
+    }
+    private var pendingPenSamples: [PendingPenSample] = []
+    private var strokeWindow: [Double] = []
+    private var strokeRing: [Double] = []
+    private var inputIdCounter = 1
 
     private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
 
@@ -135,6 +152,8 @@ final class PhoneReceiver: ObservableObject {
             if photon > -50, photon < 5000 {
                 self.photonWindow.append(max(photon, 0))
             }
+            self.recordStrokeLatencies(displayDevMs: presentedWallMs, captureMs: captureMs,
+                                       sendMs: nil, photon: true)
         }
     }
 
@@ -144,6 +163,10 @@ final class PhoneReceiver: ObservableObject {
     /// message so it can size the virtual display. Orientation-dependent:
     /// rotating the phone re-announces with swapped dimensions and the Mac
     /// rebuilds the virtual display as a portrait/landscape monitor.
+    /// Hello dimensions exclude the left sidebar strip (content area only).
+    static let sidebarWidthPoints: CGFloat = 72
+    private static let minContentPixelsWide = 512
+
     private var nativeLong = 0
     private var nativeShort = 0
     private(set) var devicePixelsWide = 0
@@ -196,19 +219,32 @@ final class PhoneReceiver: ObservableObject {
         nativeLong = long
         nativeShort = short
         deviceScale = scale
-        if devicePixelsWide == 0 {   // default landscape until the view reports
-            devicePixelsWide = long
-            devicePixelsHigh = short
+        if devicePixelsWide == 0 {
+            let content = contentPixels(portrait: false)
+            devicePixelsWide = content.wide
+            devicePixelsHigh = content.high
         }
     }
 
+    /// Content-area pixel dimensions for hello — panel minus the left sidebar.
+    func contentPixels(portrait: Bool) -> (wide: Int, high: Int) {
+        let panelW = portrait ? nativeShort : nativeLong
+        let panelH = portrait ? nativeLong : nativeShort
+        let sidebarPx = Int(Self.sidebarWidthPoints * deviceScale)
+        var contentW = panelW - sidebarPx
+        contentW = max(contentW, Self.minContentPixelsWide)
+        contentW &= ~1
+        return (contentW, panelH)
+    }
+
     func setOrientation(portrait: Bool) {
-        let w = portrait ? nativeShort : nativeLong
-        let h = portrait ? nativeLong : nativeShort
-        guard w > 0, w != devicePixelsWide else { return }
-        devicePixelsWide = w
-        devicePixelsHigh = h
-        Log.info("orientation changed -> \(portrait ? "portrait" : "landscape") \(w)x\(h)")
+        let content = contentPixels(portrait: portrait)
+        guard content.wide > 0,
+              content.wide != devicePixelsWide || content.high != devicePixelsHigh else { return }
+        devicePixelsWide = content.wide
+        devicePixelsHigh = content.high
+        Log.info("orientation changed -> \(portrait ? "portrait" : "landscape") "
+                 + "\(content.wide)x\(content.high) content (sidebar \(Int(Self.sidebarWidthPoints))pt)")
         if let connection { sendHello(on: connection) }
     }
 
@@ -238,14 +274,8 @@ final class PhoneReceiver: ObservableObject {
         }
     }
 
-    // Set while the app lingers in the background with the session alive
-    // (brief app switch): decoding is pointless and hardware decode sessions
-    // fail off-screen, so frames are dropped before the sample stage.
     private var renderingPaused = false
 
-    /// Pause/resume the video sink around a background linger. Resuming
-    /// flushes the layer and asks the Mac for a keyframe so the picture
-    /// re-syncs immediately (the Mac replays a static screen as IDR too).
     func setRenderingPaused(_ paused: Bool) {
         queue.async {
             guard paused != self.renderingPaused else { return }
@@ -260,21 +290,11 @@ final class PhoneReceiver: ObservableObject {
         }
     }
 
-    /// The device locked — nobody can see the stream, so tell the Mac and go
-    /// silent. Sends "sleeping" (the Mac drops its virtual display so the
-    /// cursor isn't stranded on an invisible screen and arms a reconnect),
-    /// then closes the connection AND the listener: while asleep we must not
-    /// accept connections, or the Mac's wake retries would rebuild the
-    /// display before anyone can see it. ensureListening() re-arms
-    /// everything when the scene becomes active again.
     func enterSleep(completion: (() -> Void)? = nil) {
         closeSession(announcing: WireMessage.sleeping,
                      status: "Asleep — resumes on wake", completion: completion)
     }
 
-    /// The app is being terminated (user swiped it away). Same close, but
-    /// announced as "closing": quitting the app is deliberate, so the Mac
-    /// ends the session without waiting around for a wake.
     func shutDown(completion: (() -> Void)? = nil) {
         closeSession(announcing: WireMessage.closing,
                      status: "Closed", completion: completion)
@@ -302,12 +322,8 @@ final class PhoneReceiver: ObservableObject {
                 return
             }
             Log.info("closing session — announcing \(type) to the Mac")
-            self.sendControl(["type": type], on: conn) {
-                self.queue.async { finish() }
-            }
-            // The send completion may never fire on a dying link — don't
-            // let that keep us accepting connections after going dark.
-            self.queue.asyncAfter(deadline: .now() + 1) { finish() }
+            self.sendControl(["type": type], on: conn)
+            self.queue.asyncAfter(deadline: .now() + 0.25) { finish() }
         }
     }
 
@@ -412,19 +428,15 @@ final class PhoneReceiver: ObservableObject {
             lastRttMs = rtt
         case "ping":
             // The Mac piggybacks its send-side health on liveness pings.
-            if let enc = obj["encDrops"] as? Int {
-                macEncDrops = enc
-            } else if let drops = obj["drops"] as? Int {
-                macEncDrops = drops
-            }
-            if let net = obj["netDrops"] as? Int {
-                macNetDrops = net
-            }
-            macDrops = macEncDrops + macNetDrops
+            macDrops = obj["drops"] as? Int ?? macDrops
+            macEncDrops = obj["encDrops"] as? Int ?? macEncDrops
+            macNetDrops = obj["netDrops"] as? Int ?? macNetDrops
             macPending = obj["pending"] as? Int ?? macPending
             macInputP50 = obj["inp50"] as? Double ?? macInputP50
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
             macCapFps = obj["capFps"] as? Int ?? macCapFps
+            macPaintP50 = obj["paint50"] as? Double ?? macPaintP50
+            macPaintP95 = obj["paint95"] as? Double ?? macPaintP95
         case "cursor":
             let visible = (obj["v"] as? Int ?? 0) == 1
             let x = obj["x"] as? Double ?? 0
@@ -507,55 +519,122 @@ final class PhoneReceiver: ObservableObject {
         Log.info("hello sent")
     }
 
-    /// Touch events: x/y normalized [0,1] in video space, origin top-left.
-    /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
-    /// measure touch→injection latency without doing its own clock sync.
-    func sendTouch(phase: String, x: Double, y: Double) {
-        var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
-        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
-        sendControl(msg)
+    func sendTouches(contacts: [WireTouchContact], osMs: Double, captureMs: Double) {
+        guard !contacts.isEmpty else { return }
+        let contactDicts: [[String: Any]] = contacts.map { c in
+            var d: [String: Any] = [
+                "id": c.id,
+                "phase": c.phase.rawValue,
+                "x": c.x,
+                "y": c.y,
+            ]
+            if let major = c.major { d["major"] = major }
+            return d
+        }
+        queue.async {
+            let devMs = self.nowMs
+            let macMs = self.clockOffsetMs.map { devMs + $0 }
+            let inpId = self.nextInputId()
+            var msg: [String: Any] = [
+                "type": WireInput.touches,
+                "phase": self.wirePhase(for: contacts),
+                "contacts": contactDicts,
+                "inpId": inpId,
+            ]
+            if let macMs { msg["t"] = macMs }
+            self.sendControl(msg, stampWire: true)
+        }
     }
 
-    /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
-    func sendScroll(dx: Double, dy: Double) {
-        sendControl(["type": "scroll", "dx": dx, "dy": dy])
+    private func wirePhase(for contacts: [WireTouchContact]) -> String {
+        if contacts.contains(where: { $0.phase == .began }) { return "began" }
+        if contacts.contains(where: { $0.phase == .ended || $0.phase == .cancelled }) {
+            return "ended"
+        }
+        return "moved"
     }
 
-    /// Apple Pencil stroke/hover. azimuth and altitude are radians.
-    /// rotation is always 0 until Apple Pencil Pro barrel roll is wired up.
-    func sendPencil(phase: String, x: Double, y: Double,
-                    pressure: Double, azimuth: Double, altitude: Double) {
-        var msg: [String: Any] = [
-            "type": "pencil",
-            "phase": phase,
-            "x": x, "y": y,
-            "pressure": pressure,
-            "azimuth": azimuth,
-            "altitude": altitude,
-            "rotation": 0,   // TODO: UIKit rollAngle once Pencil Pro is available
-        ]
-        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
-        sendControl(msg)
+    func sendPencil(phase: PencilPhase, x: Double, y: Double,
+                    pressure: Double, azimuth: Double, altitude: Double,
+                    rotation: Double, osMs: Double, captureMs: Double) {
+        queue.async {
+            let devMs = self.nowMs
+            let macMs = self.clockOffsetMs.map { devMs + $0 }
+            let inpId = self.nextInputId()
+            var msg: [String: Any] = [
+                "type": WireInput.pencil,
+                "phase": phase.rawValue,
+                "x": x, "y": y,
+                "pressure": pressure,
+                "azimuth": azimuth,
+                "altitude": altitude,
+                "rotation": rotation,
+                "inpId": inpId,
+            ]
+            if let macMs { msg["t"] = macMs }
+            if phase != .hover, let macMs {
+                self.pendingPenSamples.append(PendingPenSample(devMs: devMs, macMs: macMs))
+                if self.pendingPenSamples.count > 240 { self.pendingPenSamples.removeFirst(120) }
+            }
+            self.sendControl(msg, stampWire: true)
+        }
+    }
+
+    private func nextInputId() -> Int {
+        let id = inputIdCounter
+        inputIdCounter += 1
+        return id
     }
 
     func sendProximity(entering: Bool, x: Double, y: Double) {
-        sendControl(["type": "proximity", "entering": entering, "x": x, "y": y])
+        sendControl(["type": WireInput.proximity, "entering": entering, "x": x, "y": y])
+    }
+
+    func sendBarrelButton(down: Bool, x: Double, y: Double) {
+        sendControl(["type": WireInput.barrelButton, "down": down, "x": x, "y": y])
+    }
+
+    func sendKey(keyCode: UInt16, down: Bool) {
+        sendControl(["type": WireInput.key, "keyCode": Int(keyCode), "down": down])
+    }
+
+    func sendUndo() {
+        sendControl(["type": WireInput.shortcut, "action": WireShortcut.undo])
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
-                             completion: (() -> Void)? = nil) {
+                               stampWire: Bool = false) {
         guard let conn = conn ?? connection,
-              let payload = try? JSONSerialization.data(withJSONObject: message) else {
-            completion?()
-            return
-        }
+              let payload = try? JSONSerialization.data(withJSONObject: message) else { return }
         var header = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &header, count: 4)
         frame.append(payload)
-        conn.send(content: frame, completion: .contentProcessed { error in
+        let inpId = message["inpId"] as? Int
+        conn.send(content: frame, completion: .contentProcessed { [weak self] error in
             if let error { Log.info("control send error: \(error)") }
-            completion?()
+            guard let self, stampWire, let inpId, let offset = self.clockOffsetMs else { return }
+            self.sendControl(["type": WireProtocol.inpSent, "inpId": inpId, "tSend": self.nowMs + offset])
         })
+    }
+
+    private func recordStrokeLatencies(displayDevMs: Double, captureMs: Double,
+                                       sendMs: Double?, photon: Bool) {
+        guard clockOffsetMs != nil else { return }
+        for i in pendingPenSamples.indices {
+            guard !pendingPenSamples[i].matched else { continue }
+            guard captureMs >= pendingPenSamples[i].macMs else { continue }
+            let lat = displayDevMs - pendingPenSamples[i].devMs
+            if lat > 0, lat < 500 {
+                strokeWindow.append(lat)
+                strokeRing.append(lat)
+                if strokeRing.count > maxSamples { strokeRing.removeFirst() }
+                if LatencyTelemetry.detailedLogEnabled {
+                    Log.info("\(LatencyTelemetry.logPrefix) stroke ms=\(String(format: "%.1f", lat))")
+                }
+            }
+            pendingPenSamples[i].matched = true
+        }
+        pendingPenSamples.removeAll { $0.matched && displayDevMs - $0.devMs > 500 }
     }
 
     // MARK: - Socket read + length-prefixed deframing
@@ -700,11 +779,8 @@ final class PhoneReceiver: ObservableObject {
     }
 
     private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil, sendMs: Double? = nil) {
+        guard !renderingPaused else { return }
         guard let formatDesc else { return }
-        // Backgrounded linger: hardware decode is off-limits there, so drop
-        // frames at the door instead of feeding a failing display layer at
-        // frame rate. setRenderingPaused(false) re-syncs with a keyframe.
-        if renderingPaused { return }
 
         // Build one AVCC buffer: each NALU prefixed with 4-byte big-endian length.
         var avcc = Data(capacity: nalus.reduce(0) { $0 + $1.count + 4 })
@@ -820,6 +896,11 @@ final class PhoneReceiver: ObservableObject {
             stats.macPending = macPending
             stats.inputP50 = macInputP50
             stats.inputP95 = macInputP95
+            stats.macPaintP50 = macPaintP50
+            stats.macPaintP95 = macPaintP95
+            stats.strokeP50 = percentile(strokeWindow, 0.5)
+            stats.strokeP95 = percentile(strokeWindow, 0.95)
+            stats.strokeSamples = strokeRing
             stats.capFps = macCapFps
             stats.decodeP50 = percentile(decodeWindow, 0.5)
             stats.photonP50 = percentile(photonWindow, 0.5)
